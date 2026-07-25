@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>ChatBucket</title>
+    <link rel="stylesheet" href="/static/index.css">
+    <link rel="icon" href="/static/icons/favicon.png">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#000000">
+    <meta name="color-scheme" content="dark">
+</head>
+<body>
+
+<div id="join-screen">
+    <h1>ChatBucket</h1>
+    <input id="username" placeholder="Choose a username" maxlength="20"
+           onkeydown="if(event.key==='Enter') joinChat()">
+    <button onclick="joinChat()">Join</button>
+</div>
+
+
+<div id="chat-screen" style="display:none;">
+    <div id="header">
+        <img src="/static/icons/favicon.png" id="chat-logo" alt="">
+        <h1>ChatBucket</h1>
+        <div id="presence-bar"></div>
+    </div>
+
+    <div id="messages"></div>
+
+    <div id="bottom-zone">
+
+        <div id="reply-bar">
+            <div id="reply-bar-inner">
+                <span id="reply-bar-label">Replying to</span>
+                <span id="reply-bar-user"></span>
+                <span id="reply-bar-text"></span>
+            </div>
+            <button id="reply-bar-close" onclick="clearReply()" aria-label="Cancel reply">
+                <span class="icon close sm"></span>
+            </button>
+        </div>
+
+        <progress id="upload-progress" value="0" max="100" style="display:none;"></progress>
+
+        <div id="attachment-preview">
+            <div id="preview-list"></div>
+            <button id="cancel-attach" onclick="clearAttachments()">Clear all</button>
+        </div>
+
+        <!-- STICKER PANEL — mirrors GIF local panel layout -->
+        <div id="sticker-manager-panel" style="display:none; flex-direction:column; position:relative;">
+
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-weight:600; color:#fff; font-size:14px; letter-spacing:-0.01em;">Stickers</span>
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <button id="sticker-manual-upload-btn"
+                            onclick="document.getElementById('sticker-hidden-file-input').click()">
+                        + Add Sticker
+                    </button>
+                    <input type="file" id="sticker-hidden-file-input"
+                           accept=".png,.gif,.webp,.jpg,.jpeg"
+                           style="display:none;" onchange="handleManualStickerSelection(this)">
+                    <button class="panel-close-btn" onclick="toggleStickerDrawer()" aria-label="Close stickers">
+                        <span class="icon close sm"></span>
+                    </button>
+                </div>
+            </div>
+
+            <div style="display:flex; gap:12px; flex:1; overflow:hidden;">
+                <!-- Folder sidebar -->
+                <div id="sticker-folders" style="width:170px; overflow-y:auto; padding-right:6px;">
+                    <button id="btn-new-sticker-folder" style="width:100%; padding:7px; cursor:pointer; font-size:12px; font-weight:600; margin-bottom:8px;">
+                        + New Folder
+                    </button>
+                    <div id="sticker-folder-list-container"></div>
+                </div>
+
+                <!-- Sticker content pane -->
+                <div style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+                    <div id="sticker-dropzone" style="text-align:center; margin-bottom:10px; font-size:12px;">
+                        Drag &amp; Drop or click "+ Add Sticker"
+                    </div>
+                    <div id="sticker-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(90px, 1fr)); gap:10px; overflow-y:auto; flex:1; padding-right:2px; align-content:start;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- GIF PANEL -->
+        <div id="gif-manager-panel" style="display:none; flex-direction:column; position:relative;">
+
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div id="gif-tabs" style="display:flex; gap:6px;">
+                    <button id="tab-local-btn" onclick="switchGifTab('local')" style="background:#242424; color:#fff; border:1px solid #2a2a2a; cursor:pointer;">Local Spaces</button>
+                    <button id="tab-giphy-btn" onclick="switchGifTab('giphy')" style="background:transparent; color:#7a7a7a; border:1px solid transparent; cursor:pointer;">Giphy</button>
+                </div>
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <button id="gif-manual-upload-btn"
+                            onclick="document.getElementById('gif-hidden-file-input').click()">
+                        + Add GIF File
+                    </button>
+                    <input type="file" id="gif-hidden-file-input" accept=".gif,.webp" multiple
+      			 style="display:none;" onchange="handleManualGifSelection(this)">
+                    <button id="gif-close-pane-btn" class="panel-close-btn"
+                            onclick="toggleGifDrawer()" aria-label="Close GIF panel">
+                        <span class="icon close sm"></span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="engine-local-view" style="display:flex; gap:12px; flex:1; overflow:hidden;">
+                <div id="gif-folders" style="width:170px; overflow-y:auto; padding-right:6px;">
+                    <button id="btn-new-folder" style="width:100%; padding:7px; cursor:pointer; font-size:12px; font-weight:600; margin-bottom:8px;">
+                        + New Space
+                    </button>
+                    <div id="folder-list-container"></div>
+                </div>
+                <div id="gif-content-pane" style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+                    <div id="gif-dropzone" style="text-align:center; margin-bottom:10px; font-size:12px;">
+                        Drag &amp; Drop or click "+ Add GIF File" to save assets here
+                    </div>
+                    <div id="gif-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(110px, 1fr)); gap:10px; overflow-y:auto; flex:1; padding-right:2px;"></div>
+                </div>
+            </div>
+
+            <div id="engine-giphy-view" style="display:none; flex-direction:column; gap:10px; flex:1; overflow:hidden;">
+                <div style="display:flex; gap:8px;">
+                    <input id="giphy-search-input" placeholder="Search Giphy..." style="flex:1; font-size:13px;" onkeydown="if(event.key==='Enter') searchGiphy()">
+                    <button onclick="searchGiphy()" style="padding:7px 16px; background:#242424; border:1px solid #2a2a2a; color:#f5f5f5; border-radius:10px; cursor:pointer; font-size:13px; font-weight:600;">Search</button>
+                </div>
+                <div id="giphy-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(110px, 1fr)); gap:10px; overflow-y:auto; flex:1; padding-right:2px;"></div>
+            </div>
+        </div>
+
+        <!-- MUSIC PANEL — mirrors GIF panel layout. Three tabs: Local (sfx
+             folders, mirrors GIF/sticker local mode exactly), YouTube
+             (IFrame embed — full library, but video+ads), yt-dlp (audio
+             only, no ads, backed by this project's own /api/music/* routes). -->
+        <div id="music-manager-panel" style="display:none; flex-direction:column; position:relative;">
+
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div id="music-tabs" style="display:flex; gap:6px;">
+                    <button id="music-tab-local-btn" onclick="switchMusicTab('local')" style="background:#242424; color:#fff; border:1px solid #2a2a2a; cursor:pointer;">Local</button>
+                    <button id="music-tab-youtube-btn" onclick="switchMusicTab('youtube')" style="background:transparent; color:#7a7a7a; border:1px solid transparent; cursor:pointer;">YouTube</button>
+                    <button id="music-tab-ytdlp-btn" onclick="switchMusicTab('ytdlp')" style="background:transparent; color:#7a7a7a; border:1px solid transparent; cursor:pointer;">yt-dlp</button>
+                </div>
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <button id="music-manual-upload-btn"
+                            onclick="document.getElementById('music-hidden-file-input').click()">
+                        + Add Music File
+                    </button>
+                    <input type="file" id="music-hidden-file-input" multiple
+  			     accept=".mp3,.wav,.ogg,.m4a,.aac,.flac"
+  			     style="display:none;" onchange="handleManualMusicSelection(this)">
+                    <button id="music-close-pane-btn" class="panel-close-btn"
+                            onclick="toggleMusicDrawer()" aria-label="Close music panel">
+                        <span class="icon close sm"></span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- LOCAL — mirrors engine-local-view exactly, just a list instead of an
+                 image grid, since audio files have no natural thumbnail. -->
+            <div id="music-engine-local-view" style="display:flex; gap:12px; flex:1; overflow:hidden;">
+                <div id="music-folders" style="width:170px; overflow-y:auto; padding-right:6px;">
+                    <button id="btn-new-music-folder" style="width:100%; padding:7px; cursor:pointer; font-size:12px; font-weight:600; margin-bottom:8px;">
+                        + New Folder
+                    </button>
+                    <div id="music-folder-list-container"></div>
+                </div>
+                <div id="music-content-pane" style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+                    <div id="music-dropzone" style="text-align:center; margin-bottom:10px; font-size:12px;">
+                        Drag &amp; Drop or click "+ Add Music File" to save assets here
+                    </div>
+                    <div id="music-grid" style="display:flex; flex-direction:column; gap:6px; overflow-y:auto; flex:1; padding-right:2px;"></div>
+                </div>
+            </div>
+
+            <!-- YOUTUBE — IFrame embed. Card list (not a thumbnail grid): each
+                 card shows title/channel + a preview-play control so you can
+                 check the video before sending it. Clicking the card body
+                 anywhere else sends it immediately. -->
+            <div id="music-engine-youtube-view" style="display:none; flex-direction:column; gap:10px; flex:1; overflow:hidden;">
+                <div style="display:flex; gap:8px;">
+                    <input id="youtube-search-input" placeholder="Search YouTube..." style="flex:1; font-size:13px;" onkeydown="if(event.key==='Enter') searchYouTube()">
+                    <button onclick="searchYouTube()" style="padding:7px 16px; background:#242424; border:1px solid #2a2a2a; color:#f5f5f5; border-radius:10px; cursor:pointer; font-size:13px; font-weight:600;">Search</button>
+                </div>
+                <div id="youtube-results-list" style="display:flex; flex-direction:column; gap:8px; overflow-y:auto; flex:1; padding-right:2px;"></div>
+            </div>
+
+            <!-- YT-DLP — audio only, no ads, via this project's own
+                 /api/music/search + /api/music/stream backend. Same card
+                 shape as the YouTube tab; preview plays inline audio
+                 instead of mounting a video player. -->
+            <div id="music-engine-ytdlp-view" style="display:none; flex-direction:column; gap:10px; flex:1; overflow:hidden;">
+                <div style="display:flex; gap:8px;">
+                    <input id="ytdlp-search-input" placeholder="Search (yt-dlp, audio only)..." style="flex:1; font-size:13px;" onkeydown="if(event.key==='Enter') searchYtdlp()">
+                    <button onclick="searchYtdlp()" style="padding:7px 16px; background:#242424; border:1px solid #2a2a2a; color:#f5f5f5; border-radius:10px; cursor:pointer; font-size:13px; font-weight:600;">Search</button>
+                </div>
+                <div id="ytdlp-results-list" style="display:flex; flex-direction:column; gap:8px; overflow-y:auto; flex:1; padding-right:2px;"></div>
+            </div>
+        </div>
+
+        <div id="bottom-bar">
+            <input type="file" id="file-input" style="display:none" multiple>
+
+            <button id="attach-btn" onclick="document.getElementById('file-input').click()" title="Attach file (Alt+A)" aria-label="Attach file">
+                <span class="icon attach"></span>
+            </button>
+
+            <button id="sticker-toggle-btn" onclick="toggleStickerDrawer()" title="Stickers (Alt+S)" aria-label="Stickers">
+                <span class="icon sticker"></span>
+            </button>
+
+            <button id="gif-toggle-btn" onclick="toggleGifDrawer()" title="GIFs (Alt+G)" aria-label="GIFs">
+                <span id="gif-written-in-button">GIF</span>
+            </button>
+
+            <button id="music-toggle-btn" onclick="toggleMusicDrawer()" title="Music (Alt+M)" aria-label="Music">
+                <span id="music-written-in-button">&#9834;</span>
+            </button>
+
+            <div id="message-input" contenteditable="true" placeholder="Type a message..."></div>
+
+            <button id="send-btn" onclick="sendMessage()" title="Send" aria-label="Send message">
+                <span class="icon send sm"></span>
+            </button>
+        </div>
+
+    </div>
+</div>
+
+<audio id="notify-sound" src="/static/connect.mp3" preload="auto"></audio>
+
+<div id="drop-overlay">
+    <span class="icon attach"></span>
+    <span>Drop to attach</span>
+</div>
+
+<div id="media-viewer" onclick="closeMediaViewer(event)">
+    <img id="viewer-image" loading="lazy" style="display:none;" alt="">
+    <video id="viewer-video" controls style="display:none;"></video>
+</div>
+
+<script src="/static/index.js"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>

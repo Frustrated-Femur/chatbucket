@@ -1,0 +1,25 @@
+# Runtime data
+messages/
+uploads/
+stickers/
+gifs/
+state/
+deleted/
+cookies.txt
+
+# Codex files (optional)
+.codex/
+.agents/
+
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+
+
+.chatbucket.pid
+
+
+presence/
+sfx/

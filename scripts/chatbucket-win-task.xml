@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  ChatBucket autostart task for Win1/Win2.
+
+  Install (one-time, on each Windows machine, elevated PowerShell):
+    schtasks /Create /TN "ChatBucket" /XML scripts\chatbucket-win-task.xml
+
+  Edit before install:
+    * <UserId>       — replace DOMAIN\User with the actual account
+    * <WorkingDirectory> — replace with the actual repo path
+    * <Command>      — replace with the actual python.exe path
+                       (`where python` in cmd will tell you)
+
+  Design notes:
+    * Runs at logon, not at boot. Boot-time start would fire before
+      Syncthing/Tailscale user services are up on a default Windows
+      install, causing arbitration to fail on tailscale-CLI-unusable
+      grounds and the machine to refuse to start (arbitration.py
+      correctly refuses to guess). Logon start avoids that ordering
+      problem without extra service-dependency plumbing.
+    * DelayedStart of 30s gives Tailscale + Syncthing a chance to
+      settle before arbitration reads state/host-state.json and calls
+      `tailscale status --json`.
+    * StopIfGoingOnBatteries = false and DisallowStartIfOnBatteries
+      = false because these are desktops on mains; the defaults would
+      wrongly refuse to start on a laptop running on battery.
+    * ExecutionTimeLimit = PT0S disables the 72h auto-kill. This
+      process is meant to run indefinitely.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>ChatBucket autostart (main.py — arbitration + host or doorman).</Description>
+    <URI>\ChatBucket</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT30S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>DOMAIN\User</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Path\To\python.exe</Command>
+      <Arguments>main.py</Arguments>
+      <WorkingDirectory>C:\Path\To\chatbucket</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
