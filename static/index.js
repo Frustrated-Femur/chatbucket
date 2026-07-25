@@ -2430,6 +2430,9 @@ function addPreviewItem(file) {
             img.src       = dataUrl;
             img.className = "preview-img";
             img.style.cursor = "pointer";
+            img.draggable = false; // browsers make <img> natively draggable; that
+                                    // would race our own reorder drag below and
+                                    // wrongly trigger the external-file drop overlay
             // Click to see it full-size before sending — same viewer
             // clicking a sent chat image already opens, just with a
             // dataURL instead of a server path.
@@ -2525,6 +2528,106 @@ function removePreviewItem(item) {
     if (!attachmentFiles.length && !$("preview-list")?.querySelector(".preview-item.is-pending")) {
         preserveScrollAcrossResize($("messages"), () => { $("attachment-preview").style.display = "none"; });
     }
+}
+
+// ── attachment reorder (drag & drop) ─────────────────────────────────────
+// Plain Pointer Events (one code path for mouse + touch + pen) instead of
+// HTML5 draggable="true" — native DnD has no touch support, and this way a
+// plain tap still falls through untouched to the existing image/video/
+// audio-preview and remove-button click handlers below. Only a press that
+// actually moves past DRAG_THRESHOLD_PX counts as "click and hold and
+// drag"; anything under that is just a click, exactly as before this
+// feature existed. Works for every chip type (image/video/audio/generic
+// file) since it's wired once, by delegation, off the shared .preview-item
+// class rather than per-type.
+const DRAG_THRESHOLD_PX = 6;
+let _previewDrag = null; // { item, pointerId, startX, startY, dragging }
+
+function initAttachmentReorder() {
+    const list = $("preview-list");
+    if (!list || list._reorderInit) return;
+    list._reorderInit = true;
+    list.addEventListener("pointerdown", onPreviewPointerDown);
+    // Preview thumbnails include <img> elements, which browsers make
+    // natively draggable by default. Without this, starting a reorder drag
+    // on a thumbnail kicks off the browser's OWN drag-and-drop instead of
+    // (or racing) our pointer-based one — which also bubbles dragenter/drop
+    // up to the window-level "external file" overlay handlers further down
+    // this file, popping the "Drop to attach" screen for a drag that never
+    // left the tray. Blocking dragstart here stops that at the source, for
+    // every chip type, not just images.
+    list.addEventListener("dragstart", e => e.preventDefault());
+}
+
+function onPreviewPointerDown(e) {
+    if (_previewDrag) return;             // one attachment drag at a time
+    if (e.button !== 0) return;           // primary mouse button / touch only
+    if (e.target.closest(".preview-remove")) return; // "x" stays plain-click-only
+
+    const item = e.target.closest(".preview-item");
+    if (!item || !item._file) return;     // pending/error GIF chips aren't real files yet
+
+    _previewDrag = { item, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, dragging: false };
+    document.addEventListener("pointermove", onPreviewPointerMove);
+    document.addEventListener("pointerup", onPreviewPointerEnd);
+    document.addEventListener("pointercancel", onPreviewPointerEnd);
+}
+
+function onPreviewPointerMove(e) {
+    const st = _previewDrag;
+    if (!st || e.pointerId !== st.pointerId) return;
+
+    if (!st.dragging) {
+        if (Math.hypot(e.clientX - st.startX, e.clientY - st.startY) < DRAG_THRESHOLD_PX) return;
+        st.dragging = true;
+        st.item.classList.add("is-dragging");
+        document.body.classList.add("attachment-dragging");
+        try { st.item.setPointerCapture(st.pointerId); } catch (_) {}
+    }
+
+    e.preventDefault();
+
+    // Whichever chip the pointer is over right now — move the dragged chip
+    // immediately before/after it depending on which half it's hovering,
+    // so the tray reorders live as you drag (same feel as most sortable
+    // lists). Pointer capture doesn't affect elementFromPoint, so this
+    // still resolves to whatever's visually under the cursor.
+    const over = document.elementFromPoint(e.clientX, e.clientY)?.closest(".preview-item");
+    if (!over || over === st.item || over.parentElement !== st.item.parentElement) return;
+
+    const rect     = over.getBoundingClientRect();
+    const putBefore = e.clientX < rect.left + rect.width / 2;
+    over.parentElement.insertBefore(st.item, putBefore ? over : over.nextSibling);
+}
+
+function onPreviewPointerEnd(e) {
+    const st = _previewDrag;
+    if (!st || e.pointerId !== st.pointerId) return;
+
+    document.removeEventListener("pointermove", onPreviewPointerMove);
+    document.removeEventListener("pointerup", onPreviewPointerEnd);
+    document.removeEventListener("pointercancel", onPreviewPointerEnd);
+
+    if (st.dragging) {
+        st.item.classList.remove("is-dragging");
+        document.body.classList.remove("attachment-dragging");
+        syncAttachmentOrderFromDOM();
+        // A real drag still synthesizes a click on the same element right
+        // after pointerup — swallow exactly that one so dropping a chip
+        // doesn't also pop open the image/video/audio preview underneath it.
+        const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+        st.item.addEventListener("click", swallow, { capture: true, once: true });
+        setTimeout(() => st.item.removeEventListener("click", swallow, { capture: true }), 400);
+    }
+    _previewDrag = null;
+}
+
+// Single source of truth for send order: whatever order the chips are
+// actually sitting in, left to right, right now.
+function syncAttachmentOrderFromDOM() {
+    const list = $("preview-list");
+    if (!list) return;
+    attachmentFiles = Array.from(list.children).map(el => el._file).filter(Boolean);
 }
 
 // [FIX] Pending-GIF chip subsystem. A remote Giphy fetch can take a moment;
@@ -2695,6 +2798,10 @@ async function sendMessage() {
     if (!text && !attachmentFiles.length) return;
     if (!socket || socket.readyState !== 1) return;
 
+    // Chips may have been dragged since they were staged — resync the send
+    // order from the DOM so it always matches what's on screen, left to
+    // right, regardless of the order files were originally added in.
+    syncAttachmentOrderFromDOM();
     const filesToSend = attachmentFiles.slice();
     clearAttachments();
 
@@ -2709,7 +2816,7 @@ async function sendMessage() {
         const fileProgressArray = new Array(filesToSend.length).fill(0);
         const totalBatchBytes = filesToSend.reduce((acc, f) => acc + f.size, 0) || 1;
 
-        const uploadPromises = filesToSend.map((file, index) => new Promise((resolve) => {
+        const uploadOne = (file, index) => new Promise((resolve) => {
             const fd = new FormData();
             fd.append("file", file);
             fd.append("user", username);
@@ -2747,10 +2854,17 @@ async function sendMessage() {
             };
 
             xhr.send(fd);
-        }));
+        });
 
+        // [FIX] Sequential, not parallel — each upload is awaited before the
+        // next starts, so the server (and everyone's chat feed) receives
+        // them in the same left-to-right order shown in the tray. Firing
+        // every request at once (the old Promise.all) let whichever file
+        // finished first post first, regardless of its position on screen.
         try {
-            await Promise.all(uploadPromises);
+            for (let index = 0; index < filesToSend.length; index++) {
+                await uploadOne(filesToSend[index], index);
+            }
         } catch (e) {
             console.error(e);
         } finally {
@@ -2972,6 +3086,8 @@ function showChat() {
         if (e.target.files.length > 0) handleFiles(Array.from(e.target.files));
         e.target.value = "";
     });
+
+    initAttachmentReorder();
 
     connectWebSocket();
     requestNotifPermission();  // [QoL]
