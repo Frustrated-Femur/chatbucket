@@ -57,18 +57,19 @@ class ArbitrationError(Exception):
 
 # ── Tailscale liveness ──────────────────────────────────────────────────
 
-def _real_tailscale_checker(machine_name):
+def _fetch_tailscale_status():
     """
-    Query `tailscale status --json` and return whether `machine_name` is Online.
+    Run `tailscale status --json` and return the parsed dict.
+
+    This is the fetch/parse step every tailscale-status caller needs —
+    factored out so there is exactly one place that knows how to invoke
+    the CLI and parse its output. _real_tailscale_checker() filters this
+    down to one machine's Online bool; list_tailnet_peers() returns it
+    unfiltered. Both read the exact same data through the exact same
+    code path; neither re-implements the subprocess/JSON handling.
 
     Raises ArbitrationError if the tailscale CLI itself is unusable (not
-    installed, daemon not running, timeout) — this is deliberately NOT
-    swallowed into "assume offline", because a broken tailscale CLI on
-    THIS machine tells you nothing about whether the claimed host is
-    actually alive. Silently treating "I can't tell" as "they're dead"
-    would cause this machine to wrongly self-elect host while a real,
-    healthy host is running elsewhere — the worst kind of split-brain,
-    caused by a local tooling problem rather than an actual peer failure.
+    installed, daemon not running, timeout, or output isn't valid JSON).
     """
     try:
         result = subprocess.run(
@@ -84,9 +85,25 @@ def _real_tailscale_checker(machine_name):
         raise ArbitrationError(f"`tailscale status --json` failed: {e.stderr}")
 
     try:
-        status = json.loads(result.stdout)
+        return json.loads(result.stdout)
     except json.JSONDecodeError as e:
         raise ArbitrationError(f"tailscale status returned invalid JSON: {e}")
+
+
+def _real_tailscale_checker(machine_name):
+    """
+    Return whether `machine_name` is Online, per a fresh tailscale status.
+
+    Raises ArbitrationError if the tailscale CLI itself is unusable (not
+    installed, daemon not running, timeout) — this is deliberately NOT
+    swallowed into "assume offline", because a broken tailscale CLI on
+    THIS machine tells you nothing about whether the claimed host is
+    actually alive. Silently treating "I can't tell" as "they're dead"
+    would cause this machine to wrongly self-elect host while a real,
+    healthy host is running elsewhere — the worst kind of split-brain,
+    caused by a local tooling problem rather than an actual peer failure.
+    """
+    status = _fetch_tailscale_status()
 
     target = machine_name.lower()
     for peer in status.get("Peer", {}).values():
@@ -98,6 +115,73 @@ def _real_tailscale_checker(machine_name):
         f"Machine '{machine_name}' not found in `tailscale status` peer list "
         f"— check spelling, or that device is actually in this tailnet"
     )
+
+
+def check_machine_online(machine_name, tailscale_checker=None):
+    """
+    Public entry point for callers OUTSIDE the arbitration decision tree
+    (e.g. the Manager's status display) that just want a raw online/
+    offline answer for a machine, without invoking the full claim/defer/
+    jitter arbitration logic. Internal arbitration code (_arbitrate)
+    keeps calling _real_tailscale_checker directly via its own
+    tailscale_checker parameter — this wrapper exists so external
+    callers have a stable name to depend on instead of reaching into a
+    module-private function.
+    """
+    checker = tailscale_checker or _real_tailscale_checker
+    return checker(machine_name)
+
+
+def list_tailnet_peers(status_fetcher=None):
+    """
+    Public entry point for callers that want everything Tailscale
+    currently reports, not one name checked against a guess. Built for
+    the Manager's dynamic "what's on my tailnet right now" diagnostic
+    (ChatBucket_Manager_Architecture.md §5) — deliberately NOT a lookup
+    against a fixed roster of expected names, so a renamed or newly
+    joined device shows up under its real current name instead of
+    silently failing a hardcoded-name check. Complements
+    check_machine_online() rather than replacing it: that function
+    answers "is this one specific name online"; this one answers
+    "what names currently exist, and which of them are online".
+
+    Returns a list of dicts, one per peer in tailscale status's own
+    "Peer" list: [{"name": <str>, "online": <bool>}, ...]. `name` has
+    the trailing dot and (if present) the TAILNET_SUFFIX stripped, so
+    it reads the same way host-state.json / arbitration already refer
+    to machines ("win1", not "win1.tail888cf2.ts.net."). Deliberately
+    excludes the local machine: tailscale status --json never lists it
+    under "Peer" in the first place (it appears under the separate
+    "Self" key), so there is nothing to filter out here — a peer list
+    is inherently a list of others. Order is whatever tailscale status
+    returns (not guaranteed stable); callers that display this should
+    sort for presentation rather than assume an order.
+
+    status_fetcher: injectable for testing (no-arg callable returning
+    the parsed status dict) — separate from the tailscale_checker/
+    health_checker injection used elsewhere in this module because the
+    shape differs (no args in, a dict out, rather than a name in, a
+    bool out). Defaults to the real _fetch_tailscale_status.
+
+    Raises ArbitrationError under the same conditions as
+    check_machine_online (CLI missing, daemon down, timeout, bad JSON)
+    — this reads the same underlying data, so it fails the same way
+    for the same reasons.
+    """
+    fetch = status_fetcher or _fetch_tailscale_status
+    status = fetch()
+
+    suffix = "." + TAILNET_SUFFIX
+    peers = []
+    for peer in status.get("Peer", {}).values():
+        dns_name = peer.get("DNSName", "").rstrip(".")
+        if dns_name.lower().endswith(suffix.lower()):
+            dns_name = dns_name[: -len(suffix)]
+        peers.append({
+            "name": dns_name,
+            "online": bool(peer.get("Online", False)),
+        })
+    return peers
 
 
 # ── App-level health check ──────────────────────────────────────────────
