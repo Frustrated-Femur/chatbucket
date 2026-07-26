@@ -65,8 +65,10 @@ def _fetch_tailscale_status():
     factored out so there is exactly one place that knows how to invoke
     the CLI and parse its output. _real_tailscale_checker() filters this
     down to one machine's Online bool; list_tailnet_peers() returns it
-    unfiltered. Both read the exact same data through the exact same
-    code path; neither re-implements the subprocess/JSON handling.
+    unfiltered (minus Tailscale's own infrastructure peers, see that
+    function's docstring). Both read the exact same data through the
+    exact same code path; neither re-implements the subprocess/JSON
+    handling.
 
     Raises ArbitrationError if the tailscale CLI itself is unusable (not
     installed, daemon not running, timeout, or output isn't valid JSON).
@@ -132,30 +134,39 @@ def check_machine_online(machine_name, tailscale_checker=None):
     return checker(machine_name)
 
 
-def list_tailnet_peers(status_fetcher=None):
+def list_tailnet_peers(status_fetcher=None, include_unnamed=False):
     """
     Public entry point for callers that want everything Tailscale
-    currently reports, not one name checked against a guess. Built for
-    the Manager's dynamic "what's on my tailnet right now" diagnostic
-    (ChatBucket_Manager_Architecture.md §5) — deliberately NOT a lookup
-    against a fixed roster of expected names, so a renamed or newly
-    joined device shows up under its real current name instead of
-    silently failing a hardcoded-name check. Complements
-    check_machine_online() rather than replacing it: that function
-    answers "is this one specific name online"; this one answers
-    "what names currently exist, and which of them are online".
+    currently reports as an actual tailnet MEMBER device — not one name
+    checked against a guess, and not Tailscale's own operated
+    infrastructure mixed in with real devices.
 
-    Returns a list of dicts, one per peer in tailscale status's own
-    "Peer" list: [{"name": <str>, "online": <bool>}, ...]. `name` has
-    the trailing dot and (if present) the TAILNET_SUFFIX stripped, so
-    it reads the same way host-state.json / arbitration already refer
-    to machines ("win1", not "win1.tail888cf2.ts.net."). Deliberately
-    excludes the local machine: tailscale status --json never lists it
-    under "Peer" in the first place (it appears under the separate
-    "Self" key), so there is nothing to filter out here — a peer list
-    is inherently a list of others. Order is whatever tailscale status
-    returns (not guaranteed stable); callers that display this should
-    sort for presentation rather than assume an order.
+    Peers with no DNSName are excluded by default. Empirically confirmed
+    (2026-07-26, against this project's real tailnet): a peer lacking
+    DNSName is not a device anyone added to this tailnet — MagicDNS
+    assigns every real member device a name — it's Tailscale-operated
+    infrastructure surfacing as a peer for routing reasons (Tailscale
+    Funnel's own ingress relay nodes report
+    HostName="funnel-ingress-node", DNSName=""). Filtering on the
+    STRUCTURAL absence of DNSName, rather than on that specific hostname
+    string, means this stays correct if Tailscale ever changes Funnel's
+    naming or adds a different kind of infra peer — there's no hardcoded
+    name here to go stale.
+
+    Hidden peers are never silently dropped without a trace: the
+    returned "hidden_count" says how many were excluded, so a caller can
+    report "+N infrastructure peers hidden" instead of the count just
+    vanishing — same "surface it, don't swallow it" discipline this
+    module already applies to tailscale-CLI failures elsewhere.
+
+    Pass include_unnamed=True to see the raw, unfiltered list instead
+    (falls back to HostName, whitespace-stripped, for a peer with no
+    DNSName — "(unnamed)" if even that's missing). Useful for exactly
+    the kind of diagnosis that led to this filter existing in the first
+    place.
+
+    Returns {"peers": [{"name": str, "online": bool}, ...],
+             "hidden_count": int}.
 
     status_fetcher: injectable for testing (no-arg callable returning
     the parsed status dict) — separate from the tailscale_checker/
@@ -165,23 +176,31 @@ def list_tailnet_peers(status_fetcher=None):
 
     Raises ArbitrationError under the same conditions as
     check_machine_online (CLI missing, daemon down, timeout, bad JSON)
-    — this reads the same underlying data, so it fails the same way
-    for the same reasons.
+    — this reads the same underlying data, so it fails the same way for
+    the same reasons.
     """
     fetch = status_fetcher or _fetch_tailscale_status
     status = fetch()
 
     suffix = "." + TAILNET_SUFFIX
     peers = []
+    hidden_count = 0
     for peer in status.get("Peer", {}).values():
         dns_name = peer.get("DNSName", "").rstrip(".")
-        if dns_name.lower().endswith(suffix.lower()):
-            dns_name = dns_name[: -len(suffix)]
+        if not dns_name:
+            if not include_unnamed:
+                hidden_count += 1
+                continue
+            name = peer.get("HostName", "").strip() or "(unnamed)"
+        else:
+            if dns_name.lower().endswith(suffix.lower()):
+                dns_name = dns_name[: -len(suffix)]
+            name = dns_name
         peers.append({
-            "name": dns_name,
+            "name": name,
             "online": bool(peer.get("Online", False)),
         })
-    return peers
+    return {"peers": peers, "hidden_count": hidden_count}
 
 
 # ── App-level health check ──────────────────────────────────────────────
