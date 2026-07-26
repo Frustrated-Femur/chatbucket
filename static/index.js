@@ -2798,6 +2798,20 @@ async function sendMessage() {
     if (!text && !attachmentFiles.length) return;
     if (!socket || socket.readyState !== 1) return;
 
+    // [REDESIGN] Compress/bounce the compose bar itself as the tactile
+    // "message sent" feedback. Transform-only, one-shot, removed on
+    // animationend so a rapid burst of sends still animates each time.
+    const bar = $("bottom-bar");
+    if (bar) {
+        bar.classList.remove("is-sending");
+        // Force reflow so re-adding the class restarts the animation.
+        void bar.offsetWidth;
+        bar.classList.add("is-sending");
+        bar.addEventListener("animationend", () => {
+            bar.classList.remove("is-sending");
+        }, { once: true });
+    }
+
     // Chips may have been dragged since they were staged — resync the send
     // order from the DOM so it always matches what's on screen, left to
     // right, regardless of the order files were originally added in.
@@ -3460,6 +3474,19 @@ function appendMessage(msg) {
     }
 
     const el = buildMessageEl(msg, isNewDate ? null : lastRenderedUser);
+    // [REDESIGN] Entrance animation applied ONLY to freshly-appended nodes
+    // here, never during renderMessagesInto history passes — so this doesn't
+    // reintroduce the CPU overhead AnimatedMedia's observer was built to
+    // eliminate. `.msg-enter` / `.msg-enter-own` are transform+opacity only
+    // (GPU-cheap), and are removed on animationend so the class doesn't
+    // linger on nodes that scroll off-screen and re-enter.
+    if (!isSystem && el && el.classList) {
+        const enterClass = isOwn ? "msg-enter-own" : "msg-enter";
+        el.classList.add(enterClass);
+        el.addEventListener("animationend", () => {
+            el.classList.remove(enterClass);
+        }, { once: true });
+    }
     messagesEl.appendChild(el);
     wireAudioEnhancements(el);
     if (!isSystem) lastRenderedUser = msg.user;
@@ -3551,6 +3578,13 @@ function openGifDrawer() {
         if (musicPanel) musicPanel.style.display = "none";
         panel.style.display = "flex";
     });
+    // [REDESIGN] Panel expand animation — transform/opacity only, one-shot,
+    // removed on animationend so it doesn't play on every subsequent tab
+    // switch inside an already-open drawer.
+    panel.classList.add("drawer-opening");
+    panel.addEventListener("animationend", () => {
+        panel.classList.remove("drawer-opening");
+    }, { once: true });
 
     if (currentGifTab === "local") loadLocalGifs();
 
@@ -3863,6 +3897,11 @@ function toggleStickerDrawer() {
             if (musicPanel) musicPanel.style.display = "none";
             panel.style.display = "flex";
         });
+        // [REDESIGN] Drawer expand animation — see openGifDrawer.
+        panel.classList.add("drawer-opening");
+        panel.addEventListener("animationend", () => {
+            panel.classList.remove("drawer-opening");
+        }, { once: true });
 
         loadLocalStickers();
 
@@ -4095,6 +4134,11 @@ function openMusicDrawer() {
         if (stickerPanel) stickerPanel.style.display = "none";
         panel.style.display = "flex";
     });
+    // [REDESIGN] Drawer expand animation — see openGifDrawer.
+    panel.classList.add("drawer-opening");
+    panel.addEventListener("animationend", () => {
+        panel.classList.remove("drawer-opening");
+    }, { once: true });
 
     if (currentMusicTab === "local") loadLocalMusic();
 

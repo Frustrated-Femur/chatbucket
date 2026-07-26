@@ -185,7 +185,17 @@ def _no_heuristic_cache_for_static(response):
     # no-cache (not no-store) still lets a conditional GET short-circuit to
     # a fast 304 via the ETag/Last-Modified Werkzeug already sets — this
     # only forces "always ask," not "never cache the body."
-    if request.path.startswith("/static/"):
+    if request.path in ("/static/index.css", "/static/index.js"):
+        # [FIX] index.css/index.js are the two files under active
+        # development and the ones a stale copy visibly breaks (wrong
+        # borders, missing icons). no-store is stronger than no-cache:
+        # the browser is told not to keep a reusable copy of the body at
+        # all, so there's no local entry left to (mis)revalidate against —
+        # every load is a full network fetch, full stop. Left off the rest
+        # of /static/ (icons, uploads, sfx, etc.) since those change rarely
+        # and the no-cache + ETag revalidation below is enough for them.
+        response.headers["Cache-Control"] = "no-store"
+    elif request.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
 
