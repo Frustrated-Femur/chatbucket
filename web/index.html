@@ -67,11 +67,6 @@ h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 2
 .role-badge.stale     { color: var(--warn); }
 .role-badge.conflict  { color: var(--danger); }
 .role-badge.unknown   { color: var(--danger); }
-/* Actively in-progress gets a pulse — this is the ambient "something IS
-   happening" signal that matters even when the Manager DIDN'T initiate
-   the start itself (e.g. Task Scheduler autostart on Win1/Win2, seen
-   moments later on refresh) — a static gray badge here would look
-   identical to "stuck", which is the exact confusion being fixed. */
 .role-badge.starting {
     color: var(--text-2);
     animation: role-starting-pulse 1.4s ease-in-out infinite;
@@ -94,7 +89,7 @@ h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 2
 
 #hidden-note { color: var(--text-4); font-size: 11px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-1); }
 
-#error-banner, #warn-banner {
+#error-banner, #warn-banner, #info-banner {
     display: none;
     border-radius: var(--radius-sm);
     padding: 8px 12px;
@@ -102,7 +97,8 @@ h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 2
     margin-bottom: 14px;
 }
 #error-banner { background: #1a0e0e; color: var(--danger); border: 1px solid #3a1616; }
-#warn-banner  { background: #241c06; color: var(--warn); border: 1px solid #4a3a0f; }
+#warn-banner  { background: #241c06; color: var(--warn);   border: 1px solid #4a3a0f; }
+#info-banner  { background: #0e1a14; color: var(--success); border: 1px solid #163a24; }
 
 .process-controls { display: flex; gap: 8px; margin-top: 10px; }
 .btn {
@@ -124,9 +120,6 @@ h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 2
 .btn.danger { border-color: #4a2020; }
 .btn.danger:hover:not(:disabled) { background: #2a1414; }
 
-/* Same spinner shape/animation as ChatBucket's own .preview-spinner
-   (index.css) — reused rather than reinvented, for visual consistency
-   between the chat app and this tool. */
 .btn-spinner {
     display: inline-block;
     width: 12px;
@@ -161,6 +154,30 @@ h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 2
 #refresh-btn:disabled { opacity: 0.5; cursor: default; }
 
 #last-updated { text-align: center; color: var(--text-4); font-size: 10.5px; margin-top: 8px; letter-spacing: 0.02em; }
+
+/* ── Update card (§14) ────────────────────────────────────────
+   Kept structurally identical to every other card so it visually
+   fits the existing token language (see Architecture doc §15).
+   Version numbers use a monospace stack so digits column-align
+   at a glance ("0.9.3" vs "0.10.0" would otherwise look wrong). */
+.version-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 3px 0;
+    font-size: 12.5px;
+    color: var(--text-2);
+}
+.version-row .v-label { color: var(--text-3); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+.version-row .v-value { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; color: var(--text); }
+.update-note {
+    color: var(--text-2);
+    font-size: 12px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-1);
+}
+.update-controls { display: flex; gap: 8px; margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -170,6 +187,7 @@ h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 2
 
 <div id="error-banner"></div>
 <div id="warn-banner"></div>
+<div id="info-banner"></div>
 
 <div class="card">
     <div class="card-label">Role</div>
@@ -197,10 +215,30 @@ h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 2
     <div id="hidden-note" style="display:none;"></div>
 </div>
 
+<div class="card">
+    <div class="card-label">Version</div>
+    <div class="version-row"><span class="v-label">installed</span><span class="v-value" id="v-installed">—</span></div>
+    <div class="version-row"><span class="v-label">latest</span><span class="v-value" id="v-latest">not checked</span></div>
+    <div class="update-note" id="update-detail" style="display:none;"></div>
+    <div class="update-controls">
+        <button class="btn" id="check-update-btn">Check for Updates</button>
+        <button class="btn" id="install-update-btn" style="display:none;">Install Update</button>
+    </div>
+</div>
+
 <button id="refresh-btn">Refresh</button>
 <div id="last-updated"></div>
 
 <script>
+const STARTING_FAST_REFRESH_MS = 1500;
+const NORMAL_REFRESH_MS = 15000;
+const STARTING_MAX_VISIBLE_MS = 45000;
+
+let startingSince = null;
+let fastRefreshHandle = null;
+let normalRefreshHandle = null;
+let lastUpdateCheck = null;   // remembered latest tag for the Install click.
+
 function statusRow(dotClass, name, state) {
     const row = document.createElement("div");
     row.className = "status-row";
@@ -218,14 +256,18 @@ function statusRow(dotClass, name, state) {
     return row;
 }
 
-function showWarn(msg) {
-    const b = document.getElementById("warn-banner");
+function showBanner(id, msg) {
+    const b = document.getElementById(id);
     b.style.display = "block";
     b.textContent = msg;
 }
-function hideWarn() {
-    document.getElementById("warn-banner").style.display = "none";
+function hideBanner(id) {
+    document.getElementById(id).style.display = "none";
 }
+function showWarn(msg) { showBanner("warn-banner", msg); }
+function hideWarn()    { hideBanner("warn-banner"); }
+function showInfo(msg) { showBanner("info-banner", msg); }
+function hideInfo()    { hideBanner("info-banner"); }
 
 function setBusyLabel(btn, busyText) {
     btn.dataset.originalLabel = btn.textContent;
@@ -236,6 +278,30 @@ function restoreLabel(btn) {
         btn.textContent = btn.dataset.originalLabel;
         delete btn.dataset.originalLabel;
     }
+}
+
+function stopFastRefresh() {
+    if (fastRefreshHandle !== null) {
+        clearInterval(fastRefreshHandle);
+        fastRefreshHandle = null;
+    }
+    startingSince = null;
+}
+
+function startFastRefresh() {
+    if (fastRefreshHandle !== null) return;
+    startingSince = Date.now();
+    fastRefreshHandle = setInterval(() => {
+        if (Date.now() - startingSince > STARTING_MAX_VISIBLE_MS) {
+            stopFastRefresh();
+            showWarn(
+                "STARTING has been shown for a while — the arbitration process may " +
+                "be wedged. Try Stop, then Start again."
+            );
+            return;
+        }
+        refresh();
+    }, STARTING_FAST_REFRESH_MS);
 }
 
 function render(data) {
@@ -250,13 +316,18 @@ function render(data) {
         errorBanner.style.display = "none";
     }
 
-    // Pre-reconciled entirely in Python — never re-derived here.
     const rs = data.role_state;
     const roleBadge = document.getElementById("role-badge");
     const roleDetail = document.getElementById("role-detail");
     roleBadge.className = "role-badge " + rs.state;
     roleBadge.textContent = rs.label;
     roleDetail.textContent = rs.detail;
+
+    if (rs.state === "starting") {
+        startFastRefresh();
+    } else {
+        stopFastRefresh();
+    }
 
     const procEl = document.getElementById("process-status");
     procEl.innerHTML = "";
@@ -316,6 +387,8 @@ function render(data) {
         }
     }
 
+    document.getElementById("v-installed").textContent = data.version || "(missing)";
+
     document.getElementById("last-updated").textContent =
         "updated " + new Date().toLocaleTimeString();
 }
@@ -332,10 +405,13 @@ function setButtonsBusy(busy) {
     document.getElementById("start-btn").disabled = busy;
     document.getElementById("stop-btn").disabled = busy;
     document.getElementById("refresh-btn").disabled = busy;
+    document.getElementById("check-update-btn").disabled = busy;
+    const inst = document.getElementById("install-update-btn");
+    if (inst.style.display !== "none") inst.disabled = busy;
 }
 
 document.getElementById("start-btn").addEventListener("click", () => {
-    hideWarn();
+    hideWarn(); hideInfo();
     const btn = document.getElementById("start-btn");
     setButtonsBusy(true);
     setBusyLabel(btn, "Starting…");
@@ -349,13 +425,84 @@ document.getElementById("start-btn").addEventListener("click", () => {
 });
 
 document.getElementById("stop-btn").addEventListener("click", () => {
-    hideWarn();
+    hideWarn(); hideInfo();
     const btn = document.getElementById("stop-btn");
     setButtonsBusy(true);
     setBusyLabel(btn, "Stopping…");
     window.pywebview.api.stop().then(result => {
         if (result.action === "forced") showWarn(result.detail);
         else if (!result.ok) showWarn(result.detail || "Stop did not complete cleanly.");
+        else if (result.action === "graceful") showInfo(result.detail);
+        stopFastRefresh();
+        refresh();
+    }).finally(() => {
+        setButtonsBusy(false);
+        restoreLabel(btn);
+    });
+});
+
+document.getElementById("check-update-btn").addEventListener("click", () => {
+    hideWarn(); hideInfo();
+    const btn = document.getElementById("check-update-btn");
+    const detailEl = document.getElementById("update-detail");
+    const installBtn = document.getElementById("install-update-btn");
+    setButtonsBusy(true);
+    setBusyLabel(btn, "Checking…");
+    window.pywebview.api.check_for_updates().then(result => {
+        lastUpdateCheck = result;
+        document.getElementById("v-latest").textContent = result.latest || "unavailable";
+        detailEl.style.display = "block";
+        detailEl.textContent = result.detail;
+        if (result.ok && result.newer_available) {
+            installBtn.style.display = "inline-block";
+            installBtn.disabled = false;
+        } else {
+            installBtn.style.display = "none";
+        }
+        if (!result.ok) showWarn(result.detail);
+    }).finally(() => {
+        setButtonsBusy(false);
+        restoreLabel(btn);
+    });
+});
+
+document.getElementById("install-update-btn").addEventListener("click", () => {
+    hideWarn(); hideInfo();
+    const btn = document.getElementById("install-update-btn");
+    const detailEl = document.getElementById("update-detail");
+    // Explicit confirm — updating stops ChatBucket, per §14. That is
+    // NOT a side-effect to bury inside a spinner; the user has to
+    // consent to the process going down. Same discipline the doc
+    // uses for auto-restart-on-crash (§8) — never a silent default.
+    const ok = window.confirm(
+        "Install update?\n\n" +
+        "This will:\n" +
+        "  1. Stop ChatBucket gracefully.\n" +
+        "  2. Back up current code.\n" +
+        "  3. Download and extract the release.\n" +
+        "  4. Roll back automatically if anything fails.\n\n" +
+        "You'll need to click Start afterward to relaunch " +
+        "(restart goes through arbitration on purpose)."
+    );
+    if (!ok) return;
+
+    setButtonsBusy(true);
+    setBusyLabel(btn, "Installing…");
+    window.pywebview.api.install_update().then(result => {
+        detailEl.style.display = "block";
+        detailEl.textContent = result.detail;
+        if (result.ok && result.step === "done") {
+            showInfo(result.detail);
+            document.getElementById("install-update-btn").style.display = "none";
+            // The version we just installed is now the local one —
+            // update the row immediately without waiting for the next
+            // refresh cycle. get_status() will confirm on refresh.
+            refresh();
+        } else if (result.ok && result.step === "noop") {
+            showInfo(result.detail);
+        } else {
+            showWarn(result.detail || "Update failed.");
+        }
         refresh();
     }).finally(() => {
         setButtonsBusy(false);
@@ -367,9 +514,10 @@ document.getElementById("refresh-btn").addEventListener("click", refresh);
 
 window.addEventListener("pywebviewready", function() {
     refresh();
-    setInterval(refresh, 15000);
+    normalRefreshHandle = setInterval(refresh, NORMAL_REFRESH_MS);
 });
 </script>
 
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79"}' crossorigin="anonymous"></script>
 </body>
 </html>
