@@ -4,11 +4,6 @@
 <meta charset="utf-8">
 <title>ChatBucket Manager</title>
 <style>
-/* ── design tokens — lifted directly from ChatBucket's own index.css ──────
-   Same true-black surface stack, same font stack, same status-dot
-   convention (--success/online, gray/offline) already used throughout
-   the chat UI. The Manager should read as part of this project, not a
-   bolted-on generic tool — see ChatBucket_Manager_Architecture.md §15. */
 :root {
     --bg:          #000000;
     --surface-1:   #000000;
@@ -27,7 +22,6 @@
     --warn:        #fbbf24;
     --radius-sm:   10px;
     --radius-md:   14px;
-    --radius-pill: 999px;
     --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter",
             Roboto, "Helvetica Neue", Arial, sans-serif;
 }
@@ -46,18 +40,8 @@ body {
     user-select: none;
 }
 
-h1 {
-    font-size: 1.1rem;
-    font-weight: 700;
-    letter-spacing: -0.01em;
-    margin: 0 0 2px;
-}
-
-#subtitle {
-    color: var(--text-3);
-    font-size: 12px;
-    margin-bottom: 20px;
-}
+h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 2px; }
+#subtitle { color: var(--text-3); font-size: 12px; margin-bottom: 20px; }
 
 .card {
     background: var(--surface-2);
@@ -76,39 +60,30 @@ h1 {
     margin-bottom: 8px;
 }
 
-.role-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 1.3rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-}
-
-.role-badge.host   { color: var(--success); }
-.role-badge.client { color: var(--text); }
-.role-badge.idle   { color: var(--text-3); }
-
-.role-detail {
+.role-badge { display: inline-flex; align-items: center; gap: 8px; font-size: 1.3rem; font-weight: 700; letter-spacing: -0.02em; }
+.role-badge.host      { color: var(--success); }
+.role-badge.client    { color: var(--text); }
+.role-badge.idle      { color: var(--text-3); }
+.role-badge.stale     { color: var(--warn); }
+.role-badge.conflict  { color: var(--danger); }
+.role-badge.unknown   { color: var(--danger); }
+/* Actively in-progress gets a pulse — this is the ambient "something IS
+   happening" signal that matters even when the Manager DIDN'T initiate
+   the start itself (e.g. Task Scheduler autostart on Win1/Win2, seen
+   moments later on refresh) — a static gray badge here would look
+   identical to "stuck", which is the exact confusion being fixed. */
+.role-badge.starting {
     color: var(--text-2);
-    font-size: 12px;
-    margin-top: 4px;
+    animation: role-starting-pulse 1.4s ease-in-out infinite;
 }
+@keyframes role-starting-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+@media (prefers-reduced-motion: reduce) {
+    .role-badge.starting { animation: none; }
+}
+.role-detail { color: var(--text-2); font-size: 12px; margin-top: 4px; }
 
-.status-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 6px 0;
-    font-size: 13px;
-}
-
-.status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    flex-shrink: 0;
-}
+.status-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .status-dot.online  { background: var(--success); box-shadow: 0 0 6px rgba(74,222,128,0.5); }
 .status-dot.offline { background: #555; }
 .status-dot.error   { background: var(--danger); }
@@ -117,23 +92,55 @@ h1 {
 .peer-name { flex: 1; color: var(--text); }
 .peer-state { color: var(--text-3); font-size: 11.5px; }
 
-#hidden-note {
-    color: var(--text-4);
-    font-size: 11px;
-    margin-top: 8px;
-    padding-top: 8px;
-    border-top: 1px solid var(--border-1);
-}
+#hidden-note { color: var(--text-4); font-size: 11px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-1); }
 
-#error-banner {
+#error-banner, #warn-banner {
     display: none;
-    background: #1a0e0e;
-    color: var(--danger);
-    border: 1px solid #3a1616;
     border-radius: var(--radius-sm);
     padding: 8px 12px;
     font-size: 12px;
     margin-bottom: 14px;
+}
+#error-banner { background: #1a0e0e; color: var(--danger); border: 1px solid #3a1616; }
+#warn-banner  { background: #241c06; color: var(--warn); border: 1px solid #4a3a0f; }
+
+.process-controls { display: flex; gap: 8px; margin-top: 10px; }
+.btn {
+    flex: 1;
+    padding: 9px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid var(--border-2);
+    background: var(--surface-4);
+    color: var(--text);
+    transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+.btn:hover:not(:disabled)  { background: #2e2e2e; border-color: var(--border-3); }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn.danger { border-color: #4a2020; }
+.btn.danger:hover:not(:disabled) { background: #2a1414; }
+
+/* Same spinner shape/animation as ChatBucket's own .preview-spinner
+   (index.css) — reused rather than reinvented, for visual consistency
+   between the chat app and this tool. */
+.btn-spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.22);
+    border-top-color: var(--text);
+    animation: btn-spin 0.7s linear infinite;
+    margin-right: 7px;
+    vertical-align: -2px;
+}
+@keyframes btn-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+    .btn-spinner { animation: none; opacity: 0.6; }
 }
 
 #refresh-btn {
@@ -149,16 +156,11 @@ h1 {
     cursor: pointer;
     transition: background 120ms ease, border-color 120ms ease;
 }
-#refresh-btn:hover  { background: #2e2e2e; border-color: var(--border-3); }
-#refresh-btn:active { transform: translateY(1px); }
+#refresh-btn:hover:not(:disabled)  { background: #2e2e2e; border-color: var(--border-3); }
+#refresh-btn:active:not(:disabled) { transform: translateY(1px); }
+#refresh-btn:disabled { opacity: 0.5; cursor: default; }
 
-#last-updated {
-    text-align: center;
-    color: var(--text-4);
-    font-size: 10.5px;
-    margin-top: 8px;
-    letter-spacing: 0.02em;
-}
+#last-updated { text-align: center; color: var(--text-4); font-size: 10.5px; margin-top: 8px; letter-spacing: 0.02em; }
 </style>
 </head>
 <body>
@@ -167,11 +169,21 @@ h1 {
 <div id="subtitle">this machine: <span id="my-name">—</span></div>
 
 <div id="error-banner"></div>
+<div id="warn-banner"></div>
 
 <div class="card">
     <div class="card-label">Role</div>
     <div class="role-badge idle" id="role-badge">—</div>
     <div class="role-detail" id="role-detail"></div>
+</div>
+
+<div class="card">
+    <div class="card-label">Process</div>
+    <div id="process-status"></div>
+    <div class="process-controls">
+        <button class="btn" id="start-btn">Start</button>
+        <button class="btn danger" id="stop-btn">Stop</button>
+    </div>
 </div>
 
 <div class="card">
@@ -206,36 +218,59 @@ function statusRow(dotClass, name, state) {
     return row;
 }
 
+function showWarn(msg) {
+    const b = document.getElementById("warn-banner");
+    b.style.display = "block";
+    b.textContent = msg;
+}
+function hideWarn() {
+    document.getElementById("warn-banner").style.display = "none";
+}
+
+function setBusyLabel(btn, busyText) {
+    btn.dataset.originalLabel = btn.textContent;
+    btn.innerHTML = '<span class="btn-spinner"></span>' + busyText;
+}
+function restoreLabel(btn) {
+    if (btn.dataset.originalLabel !== undefined) {
+        btn.textContent = btn.dataset.originalLabel;
+        delete btn.dataset.originalLabel;
+    }
+}
+
 function render(data) {
     document.getElementById("my-name").textContent = data.my_name;
 
     const errorBanner = document.getElementById("error-banner");
     const hs = data.host_state;
-    const roleBadge = document.getElementById("role-badge");
-    const roleDetail = document.getElementById("role-detail");
-
     if (!hs.ok) {
         errorBanner.style.display = "block";
         errorBanner.textContent = "host-state.json is corrupted: " + hs.error;
-        roleBadge.className = "role-badge idle";
-        roleBadge.textContent = "UNKNOWN";
-        roleDetail.textContent = "";
     } else {
         errorBanner.style.display = "none";
-        const claimed = data.claimed_machine;
-        if (claimed === null) {
-            roleBadge.className = "role-badge idle";
-            roleBadge.textContent = "IDLE";
-            roleDetail.textContent = "No claim on record — nobody has ever hosted.";
-        } else if (claimed === data.my_name) {
-            roleBadge.className = "role-badge host";
-            roleBadge.textContent = "HOST";
-            roleDetail.textContent = "This machine is currently serving ChatBucket.";
-        } else {
-            roleBadge.className = "role-badge client";
-            roleBadge.textContent = "CLIENT";
-            roleDetail.textContent = "Host is currently: " + claimed;
-        }
+    }
+
+    // Pre-reconciled entirely in Python — never re-derived here.
+    const rs = data.role_state;
+    const roleBadge = document.getElementById("role-badge");
+    const roleDetail = document.getElementById("role-detail");
+    roleBadge.className = "role-badge " + rs.state;
+    roleBadge.textContent = rs.label;
+    roleDetail.textContent = rs.detail;
+
+    const procEl = document.getElementById("process-status");
+    procEl.innerHTML = "";
+    const proc = data.process;
+    const startBtn = document.getElementById("start-btn");
+    const stopBtn = document.getElementById("stop-btn");
+    if (proc.running) {
+        procEl.appendChild(statusRow("online", "pid " + proc.pid, proc.role));
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+    } else {
+        procEl.appendChild(statusRow("offline", "—", "not running"));
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
     }
 
     const claimedStatusEl = document.getElementById("claimed-status");
@@ -293,16 +328,45 @@ function refresh() {
     });
 }
 
+function setButtonsBusy(busy) {
+    document.getElementById("start-btn").disabled = busy;
+    document.getElementById("stop-btn").disabled = busy;
+    document.getElementById("refresh-btn").disabled = busy;
+}
+
+document.getElementById("start-btn").addEventListener("click", () => {
+    hideWarn();
+    const btn = document.getElementById("start-btn");
+    setButtonsBusy(true);
+    setBusyLabel(btn, "Starting…");
+    window.pywebview.api.start().then(result => {
+        if (!result.ok || result.action === "started_unconfirmed") showWarn(result.detail);
+        refresh();
+    }).finally(() => {
+        setButtonsBusy(false);
+        restoreLabel(btn);
+    });
+});
+
+document.getElementById("stop-btn").addEventListener("click", () => {
+    hideWarn();
+    const btn = document.getElementById("stop-btn");
+    setButtonsBusy(true);
+    setBusyLabel(btn, "Stopping…");
+    window.pywebview.api.stop().then(result => {
+        if (result.action === "forced") showWarn(result.detail);
+        else if (!result.ok) showWarn(result.detail || "Stop did not complete cleanly.");
+        refresh();
+    }).finally(() => {
+        setButtonsBusy(false);
+        restoreLabel(btn);
+    });
+});
+
 document.getElementById("refresh-btn").addEventListener("click", refresh);
 
-// pywebview's api bridge isn't available until this event fires — calling
-// window.pywebview.api before it does is a guaranteed silent failure.
 window.addEventListener("pywebviewready", function() {
     refresh();
-    // Lightweight auto-refresh. Each call costs 1-2 `tailscale status`
-    // subprocess invocations — negligible on this hardware at a 15s
-    // interval, not worth optimizing away for a tool that's glanced at
-    // occasionally, not polled in a hot loop.
     setInterval(refresh, 15000);
 });
 </script>

@@ -34,6 +34,7 @@
     --radius-sm:     10px;
     --radius-md:     14px;
     --radius-lg:     20px;
+    --radius-xl:     28px;
     --radius-pill:   999px;
 
     --shadow-1:      0 1px 2px rgba(0,0,0,0.6);
@@ -50,6 +51,14 @@
 
     --font:          -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter",
                       Roboto, "Helvetica Neue", Arial, sans-serif;
+
+    /* System monospace only — no webfont fetch, matches --font's own
+       offline-first reasoning (this app runs over LAN/Tailscale and
+       shouldn't depend on an external font CDN being reachable). Used
+       sparingly: island time codes and its kind badge, for a hi-fi
+       "readout" feel instead of the rest of the UI's proportional type. */
+    --font-mono:     ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono",
+                      Menlo, Consolas, "Liberation Mono", monospace;
 }
 
 /* ── reset ─────────────────────────────────────────────────────────────── */
@@ -1693,6 +1702,16 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
    music-panel rows and the online status dot) means audibly playing right
    now; the pill itself persists whether playing or paused, so pausing and
    scrolling away doesn't lose the session.
+
+   Two states, one element. Collapsed is the original compact pill —
+   thumbnail, title, playpause, close. Clicking the pill (or tapping, on
+   touch) morphs it into a full playback surface: the same header on top,
+   a big playpause, a real seekbar, and a "Go to message" button revealed
+   underneath. The morph is a single .np-expanded class toggle; every
+   dimension that changes (height/width/border-radius/padding/the art's
+   own size+shape) is an explicit, fixed target on both ends so the
+   transition is a plain, reliable CSS animation rather than anything
+   measured/animated to "auto" at runtime.
    ═════════════════════════════════════════════════════════════════════════ */
 .np-island {
     position: fixed;
@@ -1701,8 +1720,7 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     transform: translateX(-50%) translateY(-14px);
     z-index: 400;
     display: flex;
-    align-items: center;
-    gap: 10px;
+    flex-direction: column;
     min-width: 220px;
     max-width: 360px;
     height: 52px;
@@ -1715,8 +1733,15 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     box-shadow: 0 12px 34px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.04) inset;
     opacity: 0;
     pointer-events: none;
-    cursor: pointer;
-    transition: opacity 260ms ease, transform 260ms cubic-bezier(0.34, 1.56, 0.64, 1);
+    transition:
+        opacity 260ms ease,
+        transform 260ms cubic-bezier(0.34, 1.56, 0.64, 1),
+        width 420ms cubic-bezier(0.16, 1, 0.3, 1),
+        height 420ms cubic-bezier(0.16, 1, 0.3, 1),
+        border-radius 420ms cubic-bezier(0.16, 1, 0.3, 1),
+        padding 420ms cubic-bezier(0.16, 1, 0.3, 1),
+        gap 420ms cubic-bezier(0.16, 1, 0.3, 1),
+        box-shadow 420ms ease;
     overflow: hidden;
 }
 .np-island.np-visible {
@@ -1725,6 +1750,33 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     transform: translateX(-50%) translateY(0);
 }
 .np-island:hover { border-color: rgba(255,255,255,0.16); }
+
+/* Faint fractal-noise grain on the glass — keeps the blurred surface from
+   reading as a flat gradient plate, the same reason iOS/macOS "material"
+   surfaces carry grain. Deliberately subtle: this is texture, not a
+   pattern anyone should consciously notice. z-index:0 + the row/expanded
+   panel below sitting at z-index:1 keeps it strictly behind content
+   regardless of DOM/paint-order specifics for positioned vs in-flow boxes. */
+.np-island::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    opacity: 0.035;
+    mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+.np-island-row {
+    position: relative;
+    z-index: 1;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+}
 
 .np-island-art {
     position: relative;
@@ -1737,6 +1789,9 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     align-items: center;
     justify-content: center;
     background: var(--surface-3);
+    transition: width 420ms cubic-bezier(0.16, 1, 0.3, 1),
+                height 420ms cubic-bezier(0.16, 1, 0.3, 1),
+                border-radius 420ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 .np-island-thumb {
     width: 100%;
@@ -1747,6 +1802,7 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     -webkit-user-drag: none;
     user-drag: none;
     -webkit-touch-callout: none;
+    transition: border-radius 420ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 /* Fallback "art" when a session has no thumbnail (local audio, ytdlp
@@ -1791,6 +1847,7 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     border: 1.5px solid var(--success);
     opacity: 0;
     pointer-events: none;
+    transition: inset 420ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 .np-island.np-live .np-island-ring {
     animation: np-ring-pulse 1.8s ease-out infinite;
@@ -1808,6 +1865,20 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     min-width: 0;
     flex: 1;
 }
+/* Small mono "kind" readout — YouTube / YT Audio / Local Audio — shown
+   only when expanded, where there's room for it. Monospace + tracked-out
+   caps reads as a hardware/hi-fi display label, distinct from the
+   proportional type everywhere else, without needing a webfont fetch
+   (see --font-mono). */
+.np-island-kind {
+    display: none;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-3);
+}
 .np-island-title {
     font-size: 12.5px;
     font-weight: 600;
@@ -1816,6 +1887,7 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     overflow: hidden;
     text-overflow: ellipsis;
     letter-spacing: -0.005em;
+    transition: font-size 420ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 .np-island-subtitle {
     font-size: 10.5px;
@@ -1823,6 +1895,7 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    transition: font-size 420ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .np-island-playpause,
@@ -1850,6 +1923,8 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     height: 26px;
     background: transparent;
     color: var(--text-3);
+    transition: background var(--dur-fast) ease, color var(--dur-fast) ease,
+                width 420ms cubic-bezier(0.16, 1, 0.3, 1), height 420ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 .np-island-close:hover { background: var(--surface-3); color: var(--text); }
 
@@ -1858,6 +1933,9 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     left: 0; right: 0; bottom: 0;
     height: 2px;
     background: transparent;
+    z-index: 2;
+    opacity: 1;
+    transition: opacity var(--dur-med) ease;
 }
 .np-island-progress-fill {
     height: 100%;
@@ -1866,10 +1944,174 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     transition: width 480ms linear;
 }
 
+/* ── Expanded panel ───────────────────────────────────────────────────────
+   Sits below .np-island-row at all times in the DOM — while collapsed
+   it's simply clipped off by the root's fixed 52px height + overflow:
+   hidden, no display:none needed for the visual side. It IS marked inert
+   while collapsed (toggled in JS alongside the class) so a keyboard user
+   tabbing through the page can't land focus on controls that aren't
+   visibly there. */
+.np-island-expanded {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    width: 100%;
+    opacity: 0;
+    transition: opacity 200ms ease;
+}
+.np-island.np-expanded .np-island-expanded {
+    opacity: 1;
+    transition: opacity 220ms ease 160ms; /* settles in just after the card has finished most of its growth */
+}
+
+.np-island-playpause-lg {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 54px;
+    height: 54px;
+    border-radius: 50%;
+    border: none;
+    background: var(--surface-4);
+    color: var(--text);
+    cursor: pointer;
+    transition: background var(--dur-fast) ease, transform var(--dur-fast) ease, box-shadow var(--dur-med) ease;
+}
+.np-island-playpause-lg:hover { background: #333; }
+.np-island-playpause-lg:active { transform: scale(0.94); }
+.np-island-playpause-lg .icon { color: var(--text); }
+.np-island.np-live .np-island-playpause-lg {
+    box-shadow: 0 0 0 1px rgba(74,222,128,0.35), 0 0 18px rgba(74,222,128,0.18);
+}
+
+.np-island-seekrow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+}
+.np-time {
+    flex-shrink: 0;
+    min-width: 30px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+}
+.np-time-current { text-align: right; }
+.np-time-duration { text-align: left; }
+
+/* Custom range input — thin filled track + small thumb, themed to match
+   rather than the browser default. --np-seek-pct is written from JS
+   (index.js: _setSeekFillPct) alongside .value on every update, since a
+   native range input has no CSS-only way to know how "full" it is. */
+.np-island-seek {
+    --np-seek-pct: 0%;
+    flex: 1;
+    min-width: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    height: 16px;
+    margin: 0;
+    cursor: pointer;
+}
+.np-island-seek::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: linear-gradient(to right,
+        var(--success) var(--np-seek-pct),
+        rgba(255,255,255,0.16) var(--np-seek-pct));
+}
+.np-island-seek::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px;
+    height: 12px;
+    margin-top: -4px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 0 0 3px rgba(255,255,255,0.12), 0 1px 3px rgba(0,0,0,0.5);
+    transition: transform 120ms ease;
+}
+.np-island-seek:active::-webkit-slider-thumb { transform: scale(1.15); }
+.np-island-seek::-moz-range-track {
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(255,255,255,0.16);
+}
+.np-island-seek::-moz-range-progress {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--success);
+}
+.np-island-seek::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border: none;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 0 0 3px rgba(255,255,255,0.12), 0 1px 3px rgba(0,0,0,0.5);
+}
+.np-island-seek:disabled { opacity: 0.4; cursor: default; }
+.np-island-seek:focus-visible::-webkit-slider-thumb,
+.np-island-seek:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 3px var(--success); }
+
+.np-island-goto {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    padding: 9px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(255,255,255,0.1);
+    background: var(--surface-4);
+    color: var(--text-2);
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    transition: background var(--dur-fast) ease, color var(--dur-fast) ease,
+                border-color var(--dur-fast) ease, transform var(--dur-fast) ease;
+}
+.np-island-goto:hover { background: #2e2e2e; color: var(--text); border-color: var(--border-2); }
+.np-island-goto:active { transform: scale(0.98); }
+.np-goto-icon { width: 13px; height: 13px; color: currentColor; flex-shrink: 0; }
+
+/* ── State: expanded ──────────────────────────────────────────────────── */
+.np-island.np-expanded {
+    width: 320px;
+    height: 244px;
+    gap: 14px;
+    padding: 16px 18px;
+    border-radius: var(--radius-xl);
+    box-shadow: 0 20px 48px rgba(0,0,0,0.6), 0 1px 0 rgba(255,255,255,0.05) inset;
+}
+.np-island.np-expanded .np-island-art { width: 58px; height: 58px; border-radius: 16px; }
+.np-island.np-expanded .np-island-thumb { border-radius: 16px; }
+.np-island.np-expanded .np-island-ring { inset: -6px; }
+.np-island.np-expanded .np-island-eq { gap: 4px; }
+.np-island.np-expanded .np-island-eq span { width: 4px; }
+.np-island.np-expanded .np-island-kind { display: block; }
+.np-island.np-expanded .np-island-meta { gap: 3px; }
+.np-island.np-expanded .np-island-title { font-size: 15px; }
+.np-island.np-expanded .np-island-subtitle { font-size: 12px; }
+.np-island.np-expanded .np-island-playpause { display: none; }
+.np-island.np-expanded .np-island-close { width: 30px; height: 30px; }
+.np-island.np-expanded .np-island-progress { opacity: 0; }
+
 @media (prefers-reduced-motion: reduce) {
     .np-island { transition: opacity 150ms ease; }
     .np-island-eq span { animation: none; height: 10px; }
     .np-island-ring { animation: none; opacity: 0; }
+    .np-island-art,
+    .np-island-thumb,
+    .np-island-title,
+    .np-island-subtitle,
+    .np-island-close,
+    .np-island-expanded { transition: none; }
 }
 
 @media (max-width: 640px) {
@@ -1881,8 +2123,18 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
         gap: 8px;
         padding: 5px 6px 5px 5px;
     }
+    .np-island-row { gap: 8px; }
     .np-island-art { width: 34px; height: 34px; }
     .np-island-title { font-size: 12px; }
     .np-island-subtitle { font-size: 10px; }
     .np-island-playpause { width: 30px; height: 30px; }
+
+    .np-island.np-expanded {
+        width: calc(100vw - 24px);
+        max-width: 340px;
+        height: 228px;
+        padding: 14px 16px;
+    }
+    .np-island.np-expanded .np-island-art { width: 50px; height: 50px; }
+    .np-island.np-expanded .np-island-playpause-lg { width: 48px; height: 48px; }
 }

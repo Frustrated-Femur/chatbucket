@@ -1190,7 +1190,7 @@ const NowPlaying = (() => {
     function _safeCall(fn) { try { fn(); } catch (_) { /* already torn down */ } }
 
     // session = { el, kind, title, subtitle, thumbnail, msgId,
-    //             pause(), play(), getProgress() }
+    //             pause(), play(), getProgress(), seek(fraction) }
     function register(session) {
         if (active && active.el !== session.el) _safeCall(() => active.pause());
         stopAudioPreview();
@@ -1244,6 +1244,15 @@ function bindNowPlayingAudio(audioEl) {
         getProgress: () => (Number.isFinite(audioEl.duration) && audioEl.duration > 0)
             ? { current: audioEl.currentTime, duration: audioEl.duration }
             : null,
+        // [ADD] Fractional seek (0–1) for the expanded island's scrubber.
+        // Same duration guard as getProgress — metadata not loaded yet
+        // means this is a silent no-op rather than setting currentTime to
+        // NaN, which throws.
+        seek: (fraction) => {
+            if (Number.isFinite(audioEl.duration) && audioEl.duration > 0) {
+                audioEl.currentTime = Math.max(0, Math.min(1, fraction)) * audioEl.duration;
+            }
+        },
     };
 
     audioEl.addEventListener("play",    () => NowPlaying.register(session));
@@ -1263,10 +1272,24 @@ function wireNowPlayingAudio(root) {
 // regardless of scroll position. Lazily created once, then reused —
 // same "ensureX()" singleton pattern as the scroll-to-bottom button and
 // the ytdlp status pill elsewhere in this file.
+//
+// Two states. Collapsed is the original compact pill. Clicking/tapping it
+// expands it into a full playback surface: the same header on top, a big
+// playpause, a real seekbar, and a "Go to message" button revealed
+// underneath. Hovering sustains the expanded state; leaving schedules a
+// collapse after a short grace delay (_scheduleCollapse) instead of an
+// instant snap — the cursor crossing back out over the seekbar or the
+// goto button on the way to using them is normal, not a reason to slam
+// the panel shut. Scrolling the chat, hitting Escape, or tapping/tapping
+// outside all collapse it immediately instead — those exist specifically
+// for touch, which never sustains hover the way a desktop mouse does.
 const Island = (() => {
     let el = null;
     let progressTimer = null;
     let currentSession = null;
+    let expanded = false;
+    let collapseTimer = null;
+    let isScrubbing = false;
 
     function ensure() {
         if (el) return el;
@@ -1276,17 +1299,34 @@ const Island = (() => {
         el.setAttribute("role", "region");
         el.setAttribute("aria-label", "Now playing");
         el.innerHTML = `
-            <div class="np-island-art">
-                <img class="np-island-thumb" alt="" draggable="false" style="display:none;">
-                <div class="np-island-eq" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
-                <div class="np-island-ring" aria-hidden="true"></div>
+            <div class="np-island-row">
+                <div class="np-island-art">
+                    <img class="np-island-thumb" alt="" draggable="false" style="display:none;">
+                    <div class="np-island-eq" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+                    <div class="np-island-ring" aria-hidden="true"></div>
+                </div>
+                <div class="np-island-meta">
+                    <span class="np-island-kind"></span>
+                    <span class="np-island-title"></span>
+                    <span class="np-island-subtitle"></span>
+                </div>
+                <button type="button" class="np-island-playpause" aria-label="Pause"><span class="icon play sm"></span></button>
+                <button type="button" class="np-island-close" aria-label="Stop and dismiss"><span class="icon close sm"></span></button>
             </div>
-            <div class="np-island-meta">
-                <span class="np-island-title"></span>
-                <span class="np-island-subtitle"></span>
+
+            <div class="np-island-expanded" inert>
+                <button type="button" class="np-island-playpause-lg" aria-label="Pause"><span class="icon play xl"></span></button>
+                <div class="np-island-seekrow">
+                    <span class="np-time np-time-current">0:00</span>
+                    <input type="range" class="np-island-seek" min="0" max="1000" value="0" step="1" aria-label="Seek" disabled>
+                    <span class="np-time np-time-duration">0:00</span>
+                </div>
+                <button type="button" class="np-island-goto">
+                    <svg class="np-goto-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M5 15 L15 5 M9 5 H15 V11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Go to message
+                </button>
             </div>
-            <button type="button" class="np-island-playpause" aria-label="Pause"><span class="icon play sm"></span></button>
-            <button type="button" class="np-island-close" aria-label="Stop and dismiss"><span class="icon close sm"></span></button>
+
             <div class="np-island-progress"><div class="np-island-progress-fill"></div></div>
         `;
         document.body.appendChild(el);
@@ -1298,32 +1338,136 @@ const Island = (() => {
         // already used on #media-viewer's img/video elements.
         el.addEventListener("dragstart", e => e.preventDefault());
 
-        el.querySelector(".np-island-playpause").addEventListener("click", (e) => {
+        const headerRow = el.querySelector(".np-island-row");
+        const playBtn   = el.querySelector(".np-island-playpause");
+        const playBtnLg = el.querySelector(".np-island-playpause-lg");
+        const closeBtn  = el.querySelector(".np-island-close");
+        const gotoBtn   = el.querySelector(".np-island-goto");
+        const seekInput = el.querySelector(".np-island-seek");
+
+        function togglePlayback(e) {
             e.stopPropagation();
             if (!currentSession) return;
             if (el.classList.contains("np-live")) currentSession.pause();
             else currentSession.play();
-        });
+        }
+        playBtn.addEventListener("click", togglePlayback);
+        playBtnLg.addEventListener("click", togglePlayback);
 
-        el.querySelector(".np-island-close").addEventListener("click", (e) => {
+        closeBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             if (currentSession) { try { currentSession.pause(); } catch (_) {} }
             hide();
         });
 
-        // Tap the body (not the two buttons above, which already stop
-        // propagation) to jump back to the message that started this
-        // session — reuses the same scrollToMessage() the reply-quote
-        // jump already relies on, including its highlight-flash. If the
-        // message has since scrolled out of the DOM_CAP window,
-        // scrollToMessage() no-ops, same limitation the reply jump already
-        // has — not something new introduced here.
-        el.addEventListener("click", () => {
+        // Jump back to the message that started this session — reuses the
+        // same scrollToMessage() the reply-quote jump already relies on,
+        // including its highlight-flash. Collapses afterward so the panel
+        // doesn't sit there blocking the view of the message it just
+        // scrolled you to.
+        gotoBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
             if (currentSession?.msgId) scrollToMessage(currentSession.msgId);
+            collapse();
         });
+
+        // Clicking/tapping the compact header toggles the expanded panel.
+        // Scoped to the header row rather than the whole island — the
+        // expanded block below has its own buttons and seekbar, and
+        // letting stray clicks on ITS padding also toggle collapse would
+        // make the controls feel unstable to use. This doubles as the
+        // only way touch users open/close the panel, since hover never
+        // sustains anything on tap.
+        headerRow.addEventListener("click", () => { if (expanded) collapse(); else expand(); });
+
+        // Hovering sustains the expanded state; leaving schedules a
+        // collapse. Both are skipped while mid-drag on the seekbar, since
+        // a drag routinely carries the pointer outside these bounds.
+        el.addEventListener("mouseenter", _clearCollapseTimer);
+        el.addEventListener("mouseleave", () => { if (!isScrubbing) _scheduleCollapse(); });
+
+        seekInput.addEventListener("pointerdown", () => { isScrubbing = true; _clearCollapseTimer(); });
+        seekInput.addEventListener("input", () => {
+            // Live feedback while dragging — reflects the slider's own
+            // value immediately instead of waiting for the next poll
+            // tick, which would otherwise fight the drag and make the
+            // thumb visibly stutter back toward the real playback position.
+            _setSeekFillPct(seekInput.value / 10);
+            if (!currentSession) return;
+            const p = currentSession.getProgress();
+            if (p && p.duration > 0) {
+                el.querySelector(".np-time-current").textContent = _formatTime((seekInput.value / 1000) * p.duration);
+            }
+        });
+        seekInput.addEventListener("change", () => {
+            if (currentSession) currentSession.seek(seekInput.value / 1000);
+        });
+        // A drag can release with the pointer anywhere on screen, not
+        // necessarily back over the thin seekbar track — listening on
+        // window is what actually catches that reliably. Only mouse
+        // re-arms the hover-collapse timer here: touch has no hover to
+        // speak of, and re-arming off a synthetic hover state would
+        // auto-close the panel right after every scrub — exactly the kind
+        // of "why does this keep closing" annoyance to avoid.
+        window.addEventListener("pointerup", (e) => {
+            if (!isScrubbing) return;
+            isScrubbing = false;
+            if (expanded && e.pointerType === "mouse" && !el.matches(":hover")) _scheduleCollapse();
+        });
+
+        // Scrolling the chat collapses the panel immediately — reading
+        // messages takes priority over a playback surface parked mid-screen.
+        const messagesEl = document.getElementById("messages");
+        if (messagesEl) {
+            messagesEl.addEventListener("scroll", () => { if (expanded) collapse(); }, { passive: true });
+        }
+
+        // Tapping/clicking anywhere outside — the only way touch users
+        // dismiss the panel short of tapping the header again. Capture
+        // phase so this still sees the click even if whatever was tapped
+        // stops propagation in its own bubble-phase handler.
+        document.addEventListener("click", (e) => {
+            if (expanded && !el.contains(e.target)) collapse();
+        }, true);
 
         return el;
     }
+
+    function _clearCollapseTimer() {
+        if (collapseTimer) { clearTimeout(collapseTimer); collapseTimer = null; }
+    }
+
+    // [UX] A grace window, not an instant collapse-on-leave. The cursor
+    // crosses outside the island's box for a frame or two on plenty of
+    // ordinary paths toward the seekbar or the goto button — collapsing
+    // immediately would punish exactly the interaction this panel exists
+    // for, and would read as flaky rather than intentional.
+    function _scheduleCollapse() {
+        _clearCollapseTimer();
+        collapseTimer = setTimeout(collapse, 550);
+    }
+
+    function expand() {
+        if (expanded || !el) return;
+        _clearCollapseTimer();
+        expanded = true;
+        el.classList.add("np-expanded");
+        const block = el.querySelector(".np-island-expanded");
+        if (block) block.inert = false;
+        _tickProgress();
+    }
+
+    function collapse() {
+        _clearCollapseTimer();
+        if (!expanded || !el) return;
+        expanded = false;
+        isScrubbing = false;
+        el.classList.remove("np-expanded");
+        const block = el.querySelector(".np-island-expanded");
+        if (block) block.inert = true;
+    }
+
+    function isExpanded() { return expanded; }
 
     function show(session) {
         currentSession = session;
@@ -1340,6 +1484,7 @@ const Island = (() => {
             eq.style.display = "flex";
         }
 
+        node.querySelector(".np-island-kind").textContent = _kindLabel(session.kind);
         node.querySelector(".np-island-title").textContent = session.title || "Playing";
         node.querySelector(".np-island-subtitle").textContent = session.subtitle || "";
 
@@ -1347,14 +1492,26 @@ const Island = (() => {
         setPlaying(true);
     }
 
+    // Small mono "kind" readout shown only in the expanded panel — see
+    // .np-island-kind in index.css.
+    function _kindLabel(kind) {
+        if (kind === "youtube") return "YouTube";
+        if (kind === "ytdlp")   return "YT Audio";
+        if (kind === "audio")   return "Local Audio";
+        return "Playing";
+    }
+
     function setPlaying(isPlaying) {
-        const node = ensure();
+        const node  = ensure();
         node.classList.toggle("np-live", isPlaying);
-        const btn = node.querySelector(".np-island-playpause");
-        btn.innerHTML = isPlaying
-            ? `<span class="icon pause sm"></span>`
-            : `<span class="icon play sm"></span>`;
-        btn.setAttribute("aria-label", isPlaying ? "Pause" : "Play");
+        const label = isPlaying ? "Pause" : "Play";
+        const glyph = isPlaying ? "pause" : "play";
+        const btn   = node.querySelector(".np-island-playpause");
+        const btnLg = node.querySelector(".np-island-playpause-lg");
+        btn.innerHTML   = `<span class="icon ${glyph} sm"></span>`;
+        btnLg.innerHTML = `<span class="icon ${glyph} xl"></span>`;
+        btn.setAttribute("aria-label", label);
+        btnLg.setAttribute("aria-label", label);
         _toggleProgressPolling(isPlaying);
     }
 
@@ -1366,25 +1523,73 @@ const Island = (() => {
         progressTimer = setInterval(_tickProgress, 500);
     }
 
+    // Drives the seekbar's filled-track gradient (see .np-island-seek in
+    // index.css) — a native range input has no CSS-only way to know how
+    // "full" it is, so the percentage is written here as a custom property
+    // on every update, both from live drag feedback and from the poll tick.
+    function _setSeekFillPct(pct) {
+        const seekInput = el?.querySelector(".np-island-seek");
+        if (seekInput) seekInput.style.setProperty("--np-seek-pct", pct + "%");
+    }
+
+    function _formatTime(s) {
+        if (!Number.isFinite(s) || s < 0) s = 0;
+        const total = Math.floor(s);
+        const h = Math.floor(total / 3600);
+        const m = Math.floor((total % 3600) / 60);
+        const sec = total % 60;
+        return h > 0
+            ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+            : `${m}:${String(sec).padStart(2, "0")}`;
+    }
+
     function _tickProgress() {
         if (!currentSession || !el) return;
         const p = currentSession.getProgress();
+
         const fill = el.querySelector(".np-island-progress-fill");
-        if (!fill || !p || !(p.duration > 0)) return;
-        fill.style.width = Math.min(100, (p.current / p.duration) * 100) + "%";
+        if (fill && p && p.duration > 0) {
+            fill.style.width = Math.min(100, (p.current / p.duration) * 100) + "%";
+        }
+
+        // Everything below only feeds the expanded panel — skip it while
+        // collapsed, since it would just be invisible work every 500ms
+        // for as long as something plays.
+        if (!expanded) return;
+
+        const seekInput = el.querySelector(".np-island-seek");
+        const curLabel  = el.querySelector(".np-time-current");
+        const durLabel  = el.querySelector(".np-time-duration");
+        if (!p || !(p.duration > 0)) {
+            seekInput.disabled = true;
+            return;
+        }
+        seekInput.disabled = false;
+        durLabel.textContent = _formatTime(p.duration);
+        if (!isScrubbing) {
+            const pct = Math.min(1000, Math.round((p.current / p.duration) * 1000));
+            seekInput.value = pct;
+            _setSeekFillPct(pct / 10);
+            curLabel.textContent = _formatTime(p.current);
+        }
     }
 
     function hide() {
         clearInterval(progressTimer);
         progressTimer = null;
         currentSession = null;
+        _clearCollapseTimer();
+        expanded = false;
+        isScrubbing = false;
         if (!el) return;
-        el.classList.remove("np-visible", "np-live");
+        el.classList.remove("np-visible", "np-live", "np-expanded");
+        const block = el.querySelector(".np-island-expanded");
+        if (block) block.inert = true;
         // Node stays in the DOM (cheap, same pattern scroll-to-bottom-btn
         // uses) — next show() just reuses it.
     }
 
-    return { show, setPlaying, hide };
+    return { show, setPlaying, hide, isExpanded, collapse };
 })();
 
 // ── YouTube IFrame Player — lazy bootstrap + shared mount helper ───────────
@@ -1520,6 +1725,16 @@ function mountYouTubePlayer(container, videoId, opts = {}) {
                                         const c = e.target.getCurrentTime();
                                         return d > 0 ? { current: c, duration: d } : null;
                                     } catch (_) { return null; }
+                                },
+                                // [ADD] allowSeekAhead=true is correct here per the
+                                // IFrame API docs — this is a direct, deliberate user
+                                // seek (the expanded island's scrubber), not a
+                                // speculative/background one.
+                                seek: (fraction) => {
+                                    try {
+                                        const d = e.target.getDuration();
+                                        if (d > 0) e.target.seekTo(Math.max(0, Math.min(1, fraction)) * d, true);
+                                    } catch (_) {}
                                 },
                             });
                         } else {
@@ -3031,6 +3246,7 @@ function showChat() {
             const stickerPanel = $("sticker-manager-panel");
             const musicPanel   = $("music-manager-panel");
             if (viewer?.style.display === "flex")       { closeMediaViewer(null); return; }
+            if (Island.isExpanded())                    { Island.collapse(); return; }
             if (gifPanel?.style.display === "flex")     { gifPanel.style.display = "none"; $("message-input")?.focus(); return; }
             if (stickerPanel?.style.display === "flex") { stickerPanel.style.display = "none"; $("message-input")?.focus(); return; }
             if (musicPanel?.style.display === "flex")   { closeMusicDrawer(); return; }
