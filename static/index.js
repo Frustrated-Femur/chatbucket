@@ -54,6 +54,13 @@ let noMoreNewer      = true;   // true = DOM already reaches the live tail
 const PAGE_SIZE      = 50;
 // [PERF] Reduced from 400 → 150. Fewer DOM nodes = less layout/paint cost.
 const DOM_CAP        = 150;
+// [FIX] Ceiling for the unread-boundary catch-up fetch in loadHistory() —
+// see fetchEnoughForBoundary(). Reuses DOM_CAP rather than a separate
+// magic number: DOM_CAP already IS this hardware's answer to "how much
+// history is reasonable to hold at once," so the catch-up fetch that
+// exists purely to make the unread count/divider correct shouldn't pull
+// further back than the app would keep rendered anyway.
+const UNREAD_CATCHUP_CAP = DOM_CAP;
 
 let lastRenderedUser  = null;
 // [DEAD-CODE-REMOVED] `firstRenderedUser` was only ever assigned to, never read.
@@ -806,7 +813,7 @@ function retireUnreadDivider() {
     setTimeout(drop, 800);
 }
 
-function applyUnreadDivider() {
+function applyUnreadDivider(capped = false){
     // Idempotent — remove any stale divider AND any live observers/timers
     // before (re)placing.
     $("unread-divider")?.remove();
@@ -839,7 +846,10 @@ function applyUnreadDivider() {
     const divider = document.createElement("div");
     divider.id        = "unread-divider";
     divider.className = "unread-divider";
-    divider.innerHTML = `<span>${unreadCount} unread message${unreadCount !== 1 ? "s" : ""}</span>`;
+    const label = capped
+        ? `${unreadCount}+ unread messages`
+        : `${unreadCount} unread message${unreadCount !== 1 ? "s" : ""}`;
+    divider.innerHTML = `<span>${label}</span>`;
     messagesEl.insertBefore(divider, firstUnread);
 
     // One-time anchor. The one-shot dividerHandled flag in
@@ -2107,7 +2117,7 @@ async function loadHistory() {
     // signal by the time init actually arrived a moment later. Awaiting
     // both here makes the decision deterministic regardless of which
     // finishes first.
-    const [msgs, serverBoundaryTs] = await Promise.all([
+    const [firstPage, serverBoundaryTs] = await Promise.all([
         fetchPage(null),
         fetchUnreadBoundary(),
     ]);
@@ -2128,9 +2138,45 @@ async function loadHistory() {
         Unread.save();
     }
 
-    if (!msgs.length) return;
+    if (!firstPage.length) return;
+
+    // [FIX] PAGE_SIZE (50) used to cap not just one /history call but the
+    // ENTIRE unread system: applyUnreadDivider() only ever looks at
+    // .message nodes actually present in the DOM, and this used to be the
+    // only page ever fetched on load. Any boundary older than the 50 most
+    // recent messages meant the real first-unread message — and however
+    // many unread messages sat beyond it — were never fetched at all:
+    // silently undercounted, with the divider misplaced at the top of
+    // whatever 50 happened to load instead of the true first unread one.
+    //
+    // Fix: if the boundary isn't already covered by this first page, keep
+    // pulling older pages — the exact same /history?before= call
+    // loadOlderMessages() already uses, no server changes required —
+    // until the boundary is reached or UNREAD_CATCHUP_CAP is hit,
+    // whichever comes first. The common case (boundary within the last
+    // 50) resolves in the same single request as before; only a
+    // genuinely large backlog pays for extra requests, and even then it's
+    // capped rather than unbounded. See fetchEnoughForBoundary().
+    let catchupLoader = null;
+    if (Unread.boundaryTs) {
+        const firstOldestTs = Date.parse(firstPage[0].timestamp);
+        if (Number.isFinite(firstOldestTs) && firstOldestTs > Unread.boundaryTs) {
+            // Only shown when catch-up will actually need more than the
+            // page already in hand — the common case never flashes this.
+            catchupLoader = document.createElement("div");
+            catchupLoader.id = "history-catchup-loader";
+            catchupLoader.textContent = "Catching up on messages…";
+            catchupLoader.style.cssText =
+                "text-align:center;color:var(--text-3);font-size:12px;padding:16px 0;";
+            messagesEl.appendChild(catchupLoader);
+        }
+    }
+
+    const { msgs, capped, exhausted } = await fetchEnoughForBoundary(firstPage, Unread.boundaryTs);
+    catchupLoader?.remove();
 
     oldestTimestamp = msgs[0].timestamp;
+    noMoreOlder      = exhausted;
 
     const frag = document.createDocumentFragment();
     const { lastUser, lastDate } = renderMessagesInto(frag, msgs, null, null);
@@ -2157,7 +2203,7 @@ async function loadHistory() {
     //   – Otherwise scroll to bottom (fresh visit / everything already read).
     // Either way, mark the current tail as "seen" only AFTER we've committed
     // to bottom-scroll; if the divider is shown, the tail is explicitly NOT seen.
-    applyUnreadDivider();
+    applyUnreadDivider(capped);
     if (!$("unread-divider")) {
         messagesEl.scrollTop = messagesEl.scrollHeight;
         const tailTs = Date.parse(msgs[msgs.length - 1].timestamp);
@@ -2203,7 +2249,53 @@ async function fetchUnreadBoundary() {
         return null;
     }
 }
+// [FIX] Backs loadHistory()'s unread catch-up — see UNREAD_CATCHUP_CAP.
+// Starting from the newest page already fetched, pulls OLDER pages via
+// the exact same /history?before= call loadOlderMessages() already uses
+// (no server changes needed) until either:
+//   - the oldest message now loaded is at/before the boundary → every
+//     unread message is in `msgs`, exact count, correct divider spot.
+//   - UNREAD_CATCHUP_CAP is reached → stop; a huge backlog (days away
+//     during a busy stretch) degrades to an "N+ unread" label instead of
+//     pulling arbitrarily far back on every join.
+//   - history genuinely runs out first → nothing more to find, this IS
+//     the exact count even though it's technically all "unread".
+// `capped` is a floor, never a wrong count: msgs is always a real
+// contiguous slice of actual history, so unreadCount computed from it in
+// applyUnreadDivider() can undersell ("+") but never fabricate. One known
+// conservative edge, left as-is deliberately: if the true unread count
+// lands exactly on UNREAD_CATCHUP_CAP, this still reports capped=true
+// (an unnecessary "+") because the only proof-of-completeness it trusts
+// is "oldest loaded <= boundary", never "loaded count == cap" — resolving
+// that fully would cost an extra fetch on every capped case just to
+// disambiguate a cosmetic edge, not worth it for this group size.
+async function fetchEnoughForBoundary(firstPage, boundaryTs) {
+    let msgs = firstPage;
+    let lastFetchSize = firstPage.length;
 
+    if (boundaryTs) {
+        while (msgs.length < UNREAD_CATCHUP_CAP) {
+            const oldestTs = Date.parse(msgs[0].timestamp);
+            if (!Number.isFinite(oldestTs) || oldestTs <= boundaryTs) break;
+            const older = await fetchPage(msgs[0].timestamp);
+            lastFetchSize = older.length;
+            if (!older.length) break;
+            msgs = older.concat(msgs);
+        }
+    }
+
+    // A final fetch shorter than a full page — whether that was just the
+    // first page (small chat, catch-up never even engaged) or the last
+    // catch-up page — means we've reached the actual start of history,
+    // not just the boundary or the cap. Saves loadOlderMessages() a
+    // guaranteed-empty round trip the first time the user scrolls up.
+    const exhausted = lastFetchSize < PAGE_SIZE;
+
+    const oldestTs = Date.parse(msgs[0].timestamp);
+    const capped = !!boundaryTs && !exhausted && Number.isFinite(oldestTs) && oldestTs > boundaryTs;
+
+    return { msgs, capped, exhausted };
+}
 // Throttle the "couldn't load history" toast so a flaky connection doesn't
 // spam a stack of duplicate warnings.
 let _lastHistoryErrorToast = 0;
