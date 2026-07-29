@@ -4,18 +4,7 @@
     <meta charset="utf-8">
     <title>ChatBucket</title>
     <link rel="stylesheet" href="/static/index.css?v=1785044030">
-    <!-- [PERF] Overlay stylesheet. Loaded AFTER index.css so its rules
-         win the cascade without needing !important everywhere. Adds GPU
-         compositing, spring easings, content-visibility on off-screen
-         bubbles, and creative-but-cheap entrance animations. -->
-    <link rel="stylesheet" href="/static/perf-overlay.css?v=1">
     <link rel="icon" href="/static/icons/favicon.png">
-    <!-- [PERF] Preconnect to origins we know we'll hit — parallel DNS/TLS
-         warm-up so first real request lands instantly. Cheap, zero-risk. -->
-    <link rel="preconnect" href="https://static.cloudflareinsights.com" crossorigin>
-    <link rel="dns-prefetch" href="https://static.cloudflareinsights.com">
-    <!-- Preload the notify sound so first message doesn't have a fetch stall. -->
-    <link rel="preload" as="audio" href="/static/connect.mp3">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#000000">
     <meta name="color-scheme" content="dark">
@@ -254,14 +243,7 @@
 </div>
 
 <script src="/static/index.js?v=1785044030"></script>
-<!-- [PERF] Overlay script. Loaded AFTER index.js so it can monkey-patch
-     hot-path functions (escapeHTML, formatMessage, appendMessage, scroll
-     handler, trimDOM*) with cached / batched / GPU-friendly versions.
-     Each patch keeps the original as a fallback — if a patched path
-     throws, we call the original and warn — so behaviour is preserved. -->
-<script src="/static/perf-overlay.js?v=1" defer></script>
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
-<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79"}' crossorigin="anonymous"></script>
 <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79"}' crossorigin="anonymous"></script>
 </body>
 </html>

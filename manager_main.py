@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -59,15 +60,15 @@ _WEB_INDEX = os.path.join(_MANAGER_DIR, "web", "index.html")
 _VERSION_FILE = os.path.join(_REPO_ROOT, "VERSION")
 _BACKUP_DIR = os.path.join(_REPO_ROOT, ".update-backup")
 
-# Bumped from 8s -> 20s. Empirically a Gunicorn master shutting down
-# with a live gevent worker + Werkzeug fallback + the arbitration
-# health-check window can eat well past 8s on modestly loaded disks —
-# 8s force-killed a shutdown that was actually still progressing, and
-# a force-kill mid-shutdown is the exact failure mode `host-state.json`
-# stale claims come from (per Architecture doc §6). 20s is comfortably
-# above every observed graceful-stop wall time to date and still well
-# below anything a human sitting in front of the UI would call "hung."
-STOP_GRACE_SECONDS = 20
+# Was 20s, covering for gunicorn's own default --graceful-timeout
+# (30s) never actually completing before we gave up — a WebSocket
+# connection via flask_sock never voluntarily closes, so gunicorn's
+# graceful wait was pure dead time on every single stop. main.py now
+# passes --graceful-timeout 5 to gunicorn itself, so the real shutdown
+# should land well under 10s; kept above that (not shaved to the bone)
+# so a genuine slow case (e.g. a large in-flight /upload) doesn't get
+# force-killed mid-completion.
+STOP_GRACE_SECONDS = 10
 START_GRACE_SECONDS = 12          # widened: gunicorn boot + arbitration jitter
                                   # regularly ate the previous 8s window on
                                   # slower disks, leaving the badge stuck at
@@ -98,6 +99,30 @@ _UPDATE_DENY_DIRS = (
     "messages", "uploads", "gifs", "stickers", "sfx",
     "state", "presence", ".venv", ".update-backup", "__pycache__",
 )
+
+# Tray icon (§17 "not yet built" -> built 2026-07-28). Polls far more
+# often than the window's own NORMAL_REFRESH_MS (15s, in web/index.html)
+# because the tray's own poll is deliberately cheap — see
+# _tray_role_state()'s docstring for exactly why it's safe to poll this
+# much faster than the window does.
+TRAY_POLL_SECONDS = 5
+
+# Mirrors web/index.html's :root custom properties (--success/--warn/
+# --danger/--text/--text-2/--text-3) rather than inventing a separate
+# palette — same "reuse ChatBucket's own token values" call already
+# made for the web UI per Architecture doc §15, extended here to the
+# one UI surface that isn't HTML/CSS. Keys are role_state["state"]
+# values, same vocabulary _derive_role_state() already returns.
+_TRAY_STATE_COLORS = {
+    "host":     "#4ade80",   # --success
+    "client":   "#f5f5f5",   # --text
+    "starting": "#b5b5b5",   # --text-2
+    "idle":     "#7a7a7a",   # --text-3
+    "stale":    "#fbbf24",   # --warn
+    "conflict": "#ff6b6b",   # --danger
+    "unknown":  "#ff6b6b",   # --danger
+}
+_TRAY_DEFAULT_COLOR = "#7a7a7a"
 
 import arbitration
 import host_state
@@ -549,7 +574,21 @@ def _resolve_stop_target(proc):
     pgid = None
     if os.name != "nt":
         try:
-            pgid = os.getpgid(target_pid)
+            candidate_pgid = os.getpgid(target_pid)
+            # Only trust killpg when the target IS its own group leader
+            # (pgid == its own pid). Guaranteed true for anything
+            # start() launched (start_new_session=True creates a fresh
+            # session containing only that process tree) — NOT
+            # guaranteed for an externally-started instance (e.g. run
+            # interactively via chatbucket-start.sh without its own new
+            # session), which could share its terminal's process group
+            # with other, unrelated jobs in the same shell. killpg
+            # against a shared group would signal those too. When the
+            # target isn't its own leader, fall back to signalling the
+            # already-enumerated `related` pids individually instead —
+            # still correct, just not a single blanket group signal.
+            if candidate_pgid == target_pid:
+                pgid = candidate_pgid
         except (ProcessLookupError, PermissionError, OSError):
             pgid = None
 
@@ -597,6 +636,49 @@ def _derive_role_state(hs, claimed_machine, my_name, process_info):
                            f"under normal arbitration; treat as a bug, not noise.")}
     return {"state": "client", "label": "CLIENT",
             "detail": f"Host is currently: {claimed_machine} (no local doorman running)."}
+
+
+def _mark_stopped_if_mine(my_name):
+    """
+    Writes {"action": "stop"} to host-state.json after a stop
+    completes — done HERE, in the Manager, not inside server.py.
+    ChatBucket_Networking_Architecture.md §9 previously claimed
+    server.py registers its own SIGINT/SIGTERM handler for this;
+    checked directly against the actual file — no such handler exists
+    anywhere in it. That was a stale claim in the doc, not a stale
+    claim in the code, but the practical effect was the same: nothing
+    was writing "stop" on ANY shutdown path, graceful or forced, which
+    is why every stop left host-state.json claiming this machine as
+    host with no live process behind it.
+
+    Deliberately not fixed by adding a signal handler inside server.py
+    instead: gunicorn's gevent worker already owns SIGTERM for its own
+    graceful in-flight-request draining, and a second handler for the
+    same signal in the same process risks shadowing or racing
+    gunicorn's own handler rather than cooperating with it. The
+    Manager sidesteps that entirely — it's a separate process that
+    VERIFIES the target is actually gone before ever calling this. It's
+    also the only thing that CAN correctly record a stop after a
+    force-kill: SIGKILL can't be caught, so nothing inside a killed
+    process could ever do this in that path regardless of where the
+    handler lived.
+
+    Only writes if the claim still names this machine — if it doesn't,
+    something else already changed the claim in the meantime (very
+    unlikely for one machine stopping its own process, but cheap to
+    guard against) and it isn't this call's place to overwrite it.
+    """
+    hs = get_host_state()
+    if not hs["ok"] or hs["state"] is None:
+        return
+    if hs["state"].get("machine") != my_name:
+        return
+    if hs["state"].get("action") == "stop":
+        return
+    try:
+        host_state.write_state("stop", my_name)
+    except Exception:
+        pass
 
 
 # ── Update check (§14) ───────────────────────────────────────────────
@@ -980,6 +1062,7 @@ class ManagerApi:
         proc = find_chatbucket_process()
         if proc is None:
             _kill_stale_arbitrators()
+            _mark_stopped_if_mine(self.my_name)
             return {"ok": True, "action": "none", "detail": "ChatBucket is not running."}
 
         target_pid, related, pgid = _resolve_stop_target(proc)
@@ -1015,6 +1098,7 @@ class ManagerApi:
         # ── verify whole group is down, not just one pid ──────────
         if _wait_for_all_gone(list(related), STOP_GRACE_SECONDS):
             _kill_stale_arbitrators()
+            _mark_stopped_if_mine(self.my_name)
             return {"ok": True, "action": "graceful",
                     "detail": f"Stopped via {graceful_label} (target pid {target_pid})."}
 
@@ -1040,6 +1124,8 @@ class ManagerApi:
 
         force_exited = _wait_for_all_gone(list(related), 5)
         _kill_stale_arbitrators()
+        if force_exited:
+            _mark_stopped_if_mine(self.my_name)
         return {
             "ok": force_exited, "action": "forced",
             "detail": (f"Graceful stop via {graceful_label} did not complete within "
@@ -1309,13 +1395,277 @@ def _print_cli_report():
             print(f"  (+{tp['hidden_count']} infrastructure peer(s) hidden — no DNSName, likely Tailscale Funnel)")
 
 
+# ── System tray (§17 "not yet built": tray icon) ───────────────────────
+#
+# pystray/Pillow were already a declared dependency (manager_smoke_test.py's
+# 7-point check has covered "pystray+Pillow" since before this section
+# existed) — this closes that out. Nothing below is imported at module
+# level, matching how `webview` itself is only imported inside _run_gui():
+# --cli mode must keep working in an environment with no display at all,
+# and importing pystray unconditionally would break that (see
+# _select_tray_backend()'s docstring for a concrete case where a bare
+# `import pystray` can crash outright, not just fail to find an icon).
+
+def _select_tray_backend():
+    """
+    Must run BEFORE `import pystray` — pystray resolves its backend
+    exactly once, at import time (`Icon = backend().Icon` in
+    pystray/__init__.py), not via a constructor kwarg afterward.
+
+    Windows: left alone. sys.platform == 'win32' is pystray's own
+    unconditional selector for the win32 backend — no ambiguity, no
+    action needed here.
+
+    Non-Windows (in practice: Arch, the dev/test machine — see
+    Architecture doc §12, this has never run anywhere else): forced to
+    "xorg" rather than letting pystray auto-probe appindicator -> gtk
+    -> xorg on its own. Confirmed empirically (2026-07-28, sandboxed
+    Linux env with no Gtk typelib installed): pystray's probe loop only
+    catches ImportError per candidate, but gi.require_version() raises
+    ValueError when a namespace is missing — so on a machine without
+    the AppIndicator3/Ayatana gi typelib (a SEPARATE package from the
+    webkit2gtk pywebview itself needs — see doc §3's dependency-cost
+    section, never confirmed installed), a bare `import pystray` can
+    crash outright instead of falling through to the next candidate.
+
+    xorg sidesteps that failure mode entirely — it's pure Xlib
+    (python-xlib), never touches gi/Gtk, so it can't hit that crash.
+    It also can't collide with pywebview's own Gtk.main() loop, which
+    the gtk/appindicator backends could (both would want to run their
+    own; see _build_tray_icon()'s docstring for the mirror-image case
+    that in fact doesn't collide, and why).
+
+    Traded away, and worth being honest about rather than burying:
+    pystray's xorg backend sets HAS_MENU = False (confirmed by reading
+    pystray/_xorg.py directly) — no right-click context menu on Linux,
+    only a single left-click default action (also confirmed: `_on_
+    button_press` there only fires for `event.detail == 1`, i.e. left
+    button). Every MenuItem below still gets built identically on both
+    platforms — no branching needed for that — because the "default
+    action" mechanism (Icon.__call__ -> Menu.__call__ picks whichever
+    item has default=True) is generic, backend-independent pystray
+    code, not something HAS_MENU gates. Windows gets the real menu;
+    Linux gets the icon plus "click it to raise the window," which
+    covers Start/Stop/Quit indirectly by getting the user back to a
+    window that already has all three. Acceptable given Arch isn't a
+    shipped target (doc §1); not acceptable to leave unstated.
+
+    Respects an already-set PYSTRAY_BACKEND (e.g. someone testing
+    appindicator by hand) rather than clobbering it.
+    """
+    if os.name != "nt":
+        os.environ.setdefault("PYSTRAY_BACKEND", "xorg")
+
+
+def _tray_role_state(my_name):
+    """
+    A cheap subset of ManagerApi.get_status() sized for the tray's own
+    TRAY_POLL_SECONDS=5s loop — host-state.json read + local process
+    scan only. Deliberately does NOT call
+    arbitration.check_machine_online() or arbitration.list_tailnet_peers():
+    those shell out to `tailscale`, and the tray never displays peer or
+    claimed-host detail, only role_state. Running that CLI shellout on
+    a second, faster, independent timer alongside the window's own 15s
+    poll (web/index.html's NORMAL_REFRESH_MS) would double the
+    `tailscale status` call rate for a value the tray doesn't show.
+
+    Reuses get_host_state() / find_chatbucket_process() /
+    _derive_role_state() — the exact same functions ManagerApi.get_status()
+    itself calls — never a re-derivation. Same "one source of truth"
+    discipline already on record for the tailscale-peer logic and the
+    Role badge (§16.5).
+
+    Returns (role_state, process_info) — process_info is what the
+    Start/Stop menu items' `enabled=` callables check.
+    """
+    hs = get_host_state()
+    claimed_machine = None
+    if hs["ok"] and hs["state"] is not None:
+        claimed_machine = hs["state"]["machine"]
+
+    proc = find_chatbucket_process()
+    process_info = (
+        {"running": False} if proc is None
+        else {"running": True, "pid": proc["pid"], "role": proc["role"]}
+    )
+
+    role_state = _derive_role_state(hs, claimed_machine, my_name, process_info)
+    return role_state, process_info
+
+
+def _tray_icon_image(hex_color):
+    """
+    Draws a filled circle on a transparent background — no static
+    asset file to ship or locate. Colored per _TRAY_STATE_COLORS so
+    the tray is glanceable (HOST vs CLIENT vs a problem state) without
+    opening the window. 64x64 scales down cleanly to both a Linux
+    panel's ~22px and Windows' notification-area sizing.
+
+    Imported lazily (PIL, not pystray) for the same reason the rest of
+    this section defers its imports — see the section banner above.
+    """
+    from PIL import Image, ImageDraw
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    pad = 6
+    draw.ellipse([pad, pad, size - pad, size - pad], fill=hex_color)
+    return img
+
+
+def _build_tray_icon(api, window):
+    """
+    Builds — but does not start — the tray Icon. Returns None if
+    pystray/Pillow/the current display can't actually produce one; the
+    Manager runs exactly as it did before this section existed in that
+    case (window opens normally, closing it quits, same as always).
+    Never a hard requirement — see _run_gui() for how that fallback is
+    wired.
+
+    Threading model, confirmed by reading pystray's own backend source
+    rather than assumed:
+
+    - icon.run_detached() is used, never the blocking run(). On both
+      backends actually in play here (win32 always on Windows; xorg
+      forced on Linux, see _select_tray_backend()), run_detached()
+      does the exact same thing: spin the icon's own event loop on a
+      plain background thread and return immediately
+      (`threading.Thread(target=lambda: self._run()).start()`,
+      verbatim in both _win32.py and _xorg.py). Every menu-item action
+      below therefore executes on THAT background thread, not the
+      thread that called run_detached().
+
+    - window.show()/window.hide()/window.destroy() are safe to call
+      from that thread. Confirmed by reading pywebview's own platform
+      backends: gtk.py marshals every Window method through
+      `glib.idle_add(...)`, winforms.py through `self.Invoke(...)` —
+      both are the standard thread-marshaling idiom for their
+      respective toolkits, dispatching the actual call onto
+      pywebview's real GUI thread regardless of which thread invoked
+      it. This is the same mechanism that already makes calling
+      window.* from inside a js_api method (also a non-GUI thread)
+      safe today — nothing new is being relied on here.
+
+    - Start/Stop dispatch ManagerApi.start()/stop() onto their OWN
+      short-lived thread rather than calling directly, so a
+      START_GRACE_SECONDS/STOP_GRACE_SECONDS-long wait never blocks
+      the tray's event thread. A tray that stops responding to hovers
+      for up to 20s while ChatBucket is merely still stopping would
+      look identical to a hang.
+    """
+    _select_tray_backend()
+    try:
+        import pystray
+        from pystray import Menu, MenuItem
+    except Exception as e:
+        print(f"[tray] pystray unavailable — running without a tray icon: {e}")
+        return None
+
+    my_name = api.my_name
+    stop_polling = threading.Event()
+
+    def _status_text(item):
+        role_state, _ = _tray_role_state(my_name)
+        return f"Role: {role_state['label']}"
+
+    def _is_running(item):
+        _, process_info = _tray_role_state(my_name)
+        return process_info["running"]
+
+    def _is_not_running(item):
+        return not _is_running(item)
+
+    def _on_show(icon, item):
+        window.show()
+
+    def _on_start(icon, item):
+        threading.Thread(target=api.start, daemon=True).start()
+
+    def _on_stop(icon, item):
+        threading.Thread(target=api.stop, daemon=True).start()
+
+    def _on_quit(icon, item):
+        stop_polling.set()
+        # icon.stop() joins pystray's internal setup thread with a 5s
+        # timeout before giving up and logging a warning (pystray's own
+        # SETUP_THREAD_TIMEOUT). Observed directly: on a WM with no
+        # systray host at all, that thread can spend the full 5s
+        # retrying the dock and never cleanly finish -- Quit still
+        # completes (this call returns, window.destroy() below still
+        # runs), it's just up to 5s slower in that specific case. Not
+        # something fixable from this side; a WM with zero tray support
+        # means there's nowhere for the icon to go regardless.
+        icon.stop()
+        window.destroy()
+
+    menu = Menu(
+        MenuItem(_status_text, None, enabled=False),
+        Menu.SEPARATOR,
+        MenuItem("Show ChatBucket Manager", _on_show, default=True),
+        Menu.SEPARATOR,
+        MenuItem("Start ChatBucket", _on_start, enabled=_is_not_running),
+        MenuItem("Stop ChatBucket", _on_stop, enabled=_is_running),
+        Menu.SEPARATOR,
+        MenuItem("Quit Manager", _on_quit),
+    )
+
+    role_state, _ = _tray_role_state(my_name)
+    try:
+        icon = pystray.Icon(
+            "chatbucket-manager",
+            icon=_tray_icon_image(_TRAY_STATE_COLORS.get(role_state["state"], _TRAY_DEFAULT_COLOR)),
+            title=f"ChatBucket Manager - {role_state['label']}",
+            menu=menu,
+        )
+    except Exception as e:
+        print(f"[tray] failed to construct tray icon — running without one: {e}")
+        return None
+
+    def _poll_loop():
+        # stop_polling.wait() doubles as the sleep AND the early-exit
+        # check, so Quit stops this promptly instead of after up to
+        # TRAY_POLL_SECONDS of a pointless extra tick.
+        while not stop_polling.wait(TRAY_POLL_SECONDS):
+            try:
+                rs, _ = _tray_role_state(my_name)
+                icon.icon = _tray_icon_image(_TRAY_STATE_COLORS.get(rs["state"], _TRAY_DEFAULT_COLOR))
+                icon.title = f"ChatBucket Manager - {rs['label']}"
+                icon.update_menu()
+            except Exception:
+                # A single bad tick (e.g. host-state.json mid-write)
+                # should never take the tray down — try again next time.
+                pass
+
+    threading.Thread(target=_poll_loop, daemon=True).start()
+    return icon
+
+
 def _run_gui():
     import webview
     api = ManagerApi()
-    webview.create_window(
+    window = webview.create_window(
         "ChatBucket Manager", _WEB_INDEX, js_api=api,
         width=480, height=760, min_size=(380, 600),
     )
+
+    tray = _build_tray_icon(api, window)
+    if tray is not None:
+        def _on_closing():
+            window.hide()
+            return False   # False here == "cancel the close" once collected
+                            # by pywebview's Event.set(): confirmed by reading
+                            # webview/event.py (any handler returning False
+                            # makes set() return should_cancel=True) and
+                            # platforms/gtk.py's close_window() (`if
+                            # should_cancel: return True`, which is GTK's own
+                            # delete-event convention for "don't destroy me").
+        window.events.closing += _on_closing
+        tray.run_detached()
+    # else: no tray in this environment — leave the window's default
+    # close behaviour (destroy -> process exits) completely untouched.
+    # Wiring closing-hides-instead-of-closes with no tray to bring the
+    # window back would trap the user with no way to quit.
+
     try:
         webview.start()
     except KeyboardInterrupt:

@@ -71,6 +71,17 @@ def _exec_host_server():
                 "-k", "gevent",
                 "-w", "1",
                 "-b", "0.0.0.0:5000",
+                # Gunicorn's default --graceful-timeout is 30s: on
+                # SIGTERM it waits this long for "in-flight work" to
+                # finish before force-killing the worker itself. A
+                # WebSocket connection via flask_sock is indefinitely
+                # open — it never voluntarily "finishes" — so the
+                # default just means every stop silently eats up to
+                # 30s for no benefit. 5s is enough for a real in-flight
+                # HTTP request (e.g. an /upload) to complete normally;
+                # anything still open past that is a WS connection that
+                # was never going to close on its own anyway.
+                "--graceful-timeout", "5",
                 "server:app",
             ])
             # never returns on success

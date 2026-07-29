@@ -1,0 +1,346 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   ChatBucket — perf-overlay.css
+   ───────────────────────────────────────────────────────────────────────────
+   Companion to perf-overlay.js. Loaded AFTER index.css so every rule here
+   wins the cascade without needing !important (except where noted).
+
+   Layered goals:
+     • GPU-only animatable properties (transform, opacity, filter)
+     • contain: layout paint so mutations don't repaint neighbours
+     • content-visibility: auto on off-screen bubbles → instant scroll
+     • spring cubic-beziers for the "premium" feel
+     • fully backs off under prefers-reduced-motion
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── shared easing tokens ────────────────────────────────────────────────── */
+:root {
+    --ease-spring:  cubic-bezier(0.22, 1, 0.36, 1);          /* out-quint feel */
+    --ease-bounce:  cubic-bezier(0.34, 1.56, 0.64, 1);        /* mild overshoot */
+    --ease-smooth:  cubic-bezier(0.4, 0, 0.2, 1);             /* Material-ish */
+    --dur-quick:    140ms;
+    --dur-flow:     260ms;
+    --dur-swell:    420ms;
+}
+
+/* ── GPU compositor promotion ────────────────────────────────────────────── */
+/* Applied via JS to #messages. `contain: layout paint` isolates repaints so
+   a message bubble mutation doesn't invalidate the whole scroll region. */
+.gpu-layer {
+    transform: translateZ(0);
+    contain: layout paint;
+    -webkit-overflow-scrolling: touch;   /* momentum scroll on iOS */
+    overscroll-behavior: contain;         /* stops rubber-band leaking to body */
+}
+
+/* Off-screen message bubbles get skipped during layout entirely — the
+   browser reserves their intrinsic size (contain-intrinsic-size) and
+   defers painting until they intersect the viewport. This is the single
+   largest perceived-scroll win for long histories. */
+#messages .message {
+    content-visibility: auto;
+    contain-intrinsic-size: 0 72px;    /* rough avg bubble height */
+    /* Own layer so hover/copy button transitions never repaint the neighbour. */
+    contain: layout paint style;
+}
+#messages .message.has-media {
+    contain-intrinsic-size: 0 320px;
+}
+#messages .system-message,
+#messages .date-separator,
+#messages #unread-divider {
+    /* Small / structural nodes: skip content-visibility, keep them cheap. */
+    content-visibility: visible;
+}
+
+/* Smoother native scrolling everywhere it's opted in. */
+html { scroll-behavior: smooth; }
+#messages { scroll-behavior: auto; }   /* app manages its own scroll — keep manual */
+
+/* ── ripple ink ──────────────────────────────────────────────────────────── */
+/* JS injects <span class="perf-ripple"> into pressed elements. Pure CSS
+   after that: single scale + fade, compositor-only. */
+.perf-ripple {
+    position: absolute;
+    border-radius: 50%;
+    pointer-events: none;
+    background: radial-gradient(circle,
+                rgba(255,255,255,0.28) 0%,
+                rgba(255,255,255,0.12) 45%,
+                rgba(255,255,255,0)   70%);
+    transform: scale(0);
+    opacity: 0.9;
+    animation: perf-ripple 520ms var(--ease-spring) forwards;
+    mix-blend-mode: screen;
+    z-index: 1;
+}
+@keyframes perf-ripple {
+    to { transform: scale(1); opacity: 0; }
+}
+
+/* ── message bubble hover lift ──────────────────────────────────────────── */
+/* Uses transform + filter — GPU-only, so no layout, no paint on neighbours. */
+#messages .message {
+    transition:
+        transform    var(--dur-quick) var(--ease-smooth),
+        filter       var(--dur-quick) var(--ease-smooth);
+    will-change: auto;
+}
+#messages .message:hover {
+    transform: translate3d(0, -1px, 0);
+    filter: brightness(1.03);
+}
+
+/* ── send / attach button micro-interactions ────────────────────────────── */
+#send-btn, #attach-btn, #sticker-toggle-btn, #gif-toggle-btn, #music-toggle-btn {
+    transition:
+        transform var(--dur-quick) var(--ease-bounce),
+        background var(--dur-quick) var(--ease-smooth),
+        color var(--dur-quick) var(--ease-smooth) !important;
+    will-change: transform;
+}
+#send-btn:hover, #attach-btn:hover,
+#sticker-toggle-btn:hover, #gif-toggle-btn:hover, #music-toggle-btn:hover {
+    transform: translateY(-1px) scale(1.06);
+}
+#send-btn:active, #attach-btn:active,
+#sticker-toggle-btn:active, #gif-toggle-btn:active, #music-toggle-btn:active {
+    transform: translateY(0) scale(0.94);
+    transition-duration: 90ms !important;
+}
+
+/* Sending message = quick pulse on the send button so the user gets
+   immediate tactile feedback even before the socket round-trips. */
+#send-btn.perf-sending {
+    animation: perf-send-pulse 520ms var(--ease-spring);
+}
+@keyframes perf-send-pulse {
+    0%   { transform: scale(1); }
+    35%  { transform: scale(1.18); filter: brightness(1.25); }
+    100% { transform: scale(1); filter: brightness(1); }
+}
+
+/* ── media viewer spring open/close ─────────────────────────────────────── */
+/* The overlay JS toggles .perf-viewer-open on #media-viewer when it's shown. */
+#media-viewer {
+    transition:
+        background var(--dur-flow) var(--ease-smooth),
+        backdrop-filter var(--dur-flow) var(--ease-smooth);
+}
+#media-viewer #viewer-image,
+#media-viewer #viewer-video {
+    transform: scale(0.94);
+    opacity: 0;
+    transition:
+        transform var(--dur-swell) var(--ease-bounce),
+        opacity   var(--dur-flow)  var(--ease-smooth);
+    will-change: transform, opacity;
+}
+#media-viewer.perf-viewer-open #viewer-image,
+#media-viewer.perf-viewer-open #viewer-video {
+    transform: scale(1);
+    opacity: 1;
+}
+
+/* ── panel drawer glide (sticker / GIF / music) ─────────────────────────── */
+/* These already animate max-height in the base sheet; we upgrade the easing
+   and layer them on the compositor. */
+#sticker-manager-panel,
+#gif-manager-panel,
+#music-manager-panel {
+    transition:
+        max-height var(--dur-swell) var(--ease-spring),
+        opacity    var(--dur-flow)  var(--ease-smooth),
+        transform  var(--dur-swell) var(--ease-spring) !important;
+    will-change: max-height, transform, opacity;
+    transform-origin: bottom center;
+}
+
+/* ── unread divider entrance shimmer ────────────────────────────────────── */
+.unread-divider {
+    position: relative;
+    overflow: hidden;
+}
+.unread-divider::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: linear-gradient(90deg,
+                transparent 0%,
+                rgba(255,255,255,0.10) 45%,
+                rgba(255,255,255,0.18) 50%,
+                rgba(255,255,255,0.10) 55%,
+                transparent 100%);
+    transform: translateX(-100%);
+    animation: perf-shimmer 2.4s var(--ease-smooth) 1;
+    pointer-events: none;
+}
+@keyframes perf-shimmer {
+    to { transform: translateX(100%); }
+}
+
+/* ── date separator soft slide-in ───────────────────────────────────────── */
+.date-separator {
+    animation: perf-date-slide 420ms var(--ease-spring) both;
+}
+@keyframes perf-date-slide {
+    from { opacity: 0; transform: translate3d(0, -6px, 0); }
+    to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+/* ── presence dot pulse on status change ────────────────────────────────── */
+.status-dot.perf-pulse {
+    animation: perf-dot-pulse 700ms var(--ease-spring);
+}
+@keyframes perf-dot-pulse {
+    0%   { transform: scale(1); box-shadow: 0 0 0 0 currentColor; }
+    50%  { transform: scale(1.35); box-shadow: 0 0 0 6px transparent; }
+    100% { transform: scale(1); }
+}
+
+/* ── scroll-to-bottom button entrance ───────────────────────────────────── */
+#scroll-to-bottom-btn {
+    animation: perf-fab-in 380ms var(--ease-bounce) both;
+    will-change: transform, opacity;
+}
+@keyframes perf-fab-in {
+    from { opacity: 0; transform: translate3d(-50%, 24px, 0) scale(0.7); }
+    to   { opacity: 1; transform: translate3d(-50%, 0, 0)  scale(1);   }
+}
+
+/* ── toast: replace stock ease with spring (also nudged from JS) ────────── */
+.toast {
+    will-change: transform, opacity;
+}
+
+/* ── reply-jump highlight faster + smoother ─────────────────────────────── */
+.message.reply-flash {
+    transition: background 640ms var(--ease-smooth) !important;
+}
+
+/* ── typing indicator smooth fade ───────────────────────────────────────── */
+#typing-indicator {
+    transition: opacity 220ms var(--ease-smooth);
+    will-change: opacity;
+}
+
+/* ── join screen: layered springy entry ─────────────────────────────────── */
+#join-screen {
+    animation: perf-join-in 520ms var(--ease-spring) both;
+}
+#join-screen h1     { animation: perf-join-child 620ms var(--ease-spring) 60ms both; }
+#join-screen input  { animation: perf-join-child 620ms var(--ease-spring) 140ms both; }
+#join-screen button { animation: perf-join-child 620ms var(--ease-spring) 220ms both; }
+@keyframes perf-join-in {
+    from { opacity: 0; transform: translate3d(0, 12px, 0) scale(0.98); }
+    to   { opacity: 1; transform: translate3d(0, 0, 0)   scale(1);    }
+}
+@keyframes perf-join-child {
+    from { opacity: 0; transform: translate3d(0, 8px, 0); }
+    to   { opacity: 1; transform: translate3d(0, 0, 0);   }
+}
+
+/* ── chat screen big fade-in ────────────────────────────────────────────── */
+#chat-screen {
+    animation: perf-chat-in 380ms var(--ease-smooth) both;
+}
+@keyframes perf-chat-in {
+    from { opacity: 0; filter: blur(4px); }
+    to   { opacity: 1; filter: blur(0);   }
+}
+
+/* ── sticker/GIF grid staggered fade-in (very cheap: uses :nth-child) ──── */
+#sticker-grid > *, #gif-grid > *, #giphy-grid > * {
+    animation: perf-tile-in 340ms var(--ease-spring) both;
+    will-change: transform, opacity;
+}
+#sticker-grid > *:nth-child(1),  #gif-grid > *:nth-child(1),  #giphy-grid > *:nth-child(1)  { animation-delay:   0ms; }
+#sticker-grid > *:nth-child(2),  #gif-grid > *:nth-child(2),  #giphy-grid > *:nth-child(2)  { animation-delay:  30ms; }
+#sticker-grid > *:nth-child(3),  #gif-grid > *:nth-child(3),  #giphy-grid > *:nth-child(3)  { animation-delay:  60ms; }
+#sticker-grid > *:nth-child(4),  #gif-grid > *:nth-child(4),  #giphy-grid > *:nth-child(4)  { animation-delay:  90ms; }
+#sticker-grid > *:nth-child(5),  #gif-grid > *:nth-child(5),  #giphy-grid > *:nth-child(5)  { animation-delay: 120ms; }
+#sticker-grid > *:nth-child(6),  #gif-grid > *:nth-child(6),  #giphy-grid > *:nth-child(6)  { animation-delay: 150ms; }
+#sticker-grid > *:nth-child(7),  #gif-grid > *:nth-child(7),  #giphy-grid > *:nth-child(7)  { animation-delay: 180ms; }
+#sticker-grid > *:nth-child(8),  #gif-grid > *:nth-child(8),  #giphy-grid > *:nth-child(8)  { animation-delay: 210ms; }
+#sticker-grid > *:nth-child(n+9),#gif-grid > *:nth-child(n+9),#giphy-grid > *:nth-child(n+9){ animation-delay: 240ms; }
+
+@keyframes perf-tile-in {
+    from { opacity: 0; transform: translate3d(0, 8px, 0) scale(0.94); }
+    to   { opacity: 1; transform: translate3d(0, 0, 0)   scale(1);    }
+}
+
+/* Sticker/GIF cell hover lift with GPU-only transform */
+.chat-sticker, #gif-grid > *, #sticker-grid > *, #giphy-grid > * {
+    transition: transform 220ms var(--ease-spring), filter 220ms var(--ease-smooth);
+    will-change: transform;
+}
+.chat-sticker:hover, #gif-grid > *:hover, #sticker-grid > *:hover, #giphy-grid > *:hover {
+    transform: translate3d(0, -3px, 0) scale(1.04);
+    filter: brightness(1.06);
+}
+
+/* ── attachment preview chip pop ────────────────────────────────────────── */
+.preview-item {
+    animation: perf-chip-in 340ms var(--ease-bounce) both;
+    will-change: transform, opacity;
+}
+@keyframes perf-chip-in {
+    from { opacity: 0; transform: translate3d(0, 6px, 0) scale(0.9); }
+    to   { opacity: 1; transform: translate3d(0, 0, 0)   scale(1);   }
+}
+
+/* ── input focus glow (compositor-only via filter) ──────────────────────── */
+#message-input {
+    transition: filter var(--dur-quick) var(--ease-smooth),
+                background var(--dur-quick) var(--ease-smooth);
+}
+#message-input:focus {
+    filter: drop-shadow(0 0 6px rgba(125,185,255,0.28));
+}
+
+/* ── image lazy-in fade so pop-in isn't jarring ─────────────────────────── */
+#messages img {
+    transition: opacity 320ms var(--ease-smooth), filter 320ms var(--ease-smooth);
+}
+#messages img[data-src] {
+    opacity: 0;
+    filter: blur(6px);
+}
+#messages img:not([data-src]) {
+    opacity: 1;
+    filter: blur(0);
+}
+
+/* ── tab-hidden = pause every heavy animation, save CPU/battery ──────── */
+body.tab-hidden .preview-spinner,
+body.tab-hidden .ytdlp-status-spinner,
+body.tab-hidden .np-island-eq span,
+body.tab-hidden .unread-divider::after,
+body.tab-hidden #scroll-to-bottom-btn,
+body.tab-hidden .perf-ripple {
+    animation-play-state: paused !important;
+}
+
+/* ── reduced motion: neutralise every animation we added ─────────────── */
+@media (prefers-reduced-motion: reduce) {
+    .perf-ripple,
+    .unread-divider::after,
+    .date-separator,
+    .status-dot.perf-pulse,
+    #scroll-to-bottom-btn,
+    #join-screen, #join-screen h1, #join-screen input, #join-screen button,
+    #chat-screen,
+    #sticker-grid > *, #gif-grid > *, #giphy-grid > *,
+    .preview-item,
+    #send-btn.perf-sending {
+        animation: none !important;
+    }
+    #messages .message:hover {
+        transform: none;
+        filter: none;
+    }
+}
+
+/* ── final safeguard: `will-change` sprawl ───────────────────────────── */
+/* will-change is a HINT — leaving it set forever wastes RAM. We only put
+   it on hoverable/animated states so the compositor promotes them only
+   while they're actually moving. Nothing to add here — comment for the
+   next reader. */
