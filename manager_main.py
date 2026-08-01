@@ -59,6 +59,15 @@ _MANAGER_DIR = os.path.dirname(_MANAGER_FILE)
 _WEB_INDEX = os.path.join(_MANAGER_DIR, "web", "index.html")
 _VERSION_FILE = os.path.join(_REPO_ROOT, "VERSION")
 _BACKUP_DIR = os.path.join(_REPO_ROOT, ".update-backup")
+# Repo root, deliberately NOT inside manager/: _backup_current_code()
+# moves manager/ wholesale on every update (whole-directory match
+# against _UPDATE_ALLOWLIST_DIRS, not a per-file suffix check), which
+# would silently disappear a user's manually-entered Syncthing API key
+# on the very next update if it lived there instead. A repo-root file
+# named neither "VERSION" nor ending in .py/.txt is untouched by both
+# the backup move and the extraction allow-list, with no changes
+# needed to either.
+_MANAGER_CONFIG_FILE = os.path.join(_REPO_ROOT, "manager_config.json")
 
 # Was 20s, covering for gunicorn's own default --graceful-timeout
 # (30s) never actually completing before we gave up — a WebSocket
@@ -124,6 +133,16 @@ _TRAY_STATE_COLORS = {
 }
 _TRAY_DEFAULT_COLOR = "#7a7a7a"
 
+# Syncthing status (§17 "not yet built" -> built 2026-07-29). Folder ID
+# per Architecture doc §10's filesystem tree (state/ IS "sync-state").
+# Syncthing's own REST docs flag /rest/db/status as "expensive...use
+# sparingly" -- throttled independently of, and slower than, the
+# window's own 15s poll (get_status() calls this every poll tick, but
+# the cache below skips the actual HTTP call until this many seconds
+# have passed).
+_SYNCTHING_FOLDER_ID = "sync-state"
+_SYNCTHING_CHECK_MIN_INTERVAL_SECONDS = 30
+
 import arbitration
 import host_state
 import main as cb_main
@@ -183,6 +202,85 @@ def get_tailnet_peers():
         return {"ok": True, "peers": list(result), "hidden_count": 0}
     except arbitration.ArbitrationError as e:
         return {"ok": False, "error": str(e)}
+
+
+def _read_manager_config():
+    """
+    manager_config.json at repo root (see _MANAGER_CONFIG_FILE). A
+    missing file is the expected default (nothing configured yet, per
+    §5's "real, non-zero setup friction — budgeted honestly"), not an
+    error — every caller treats a missing file the same as an empty {}.
+    """
+    if not os.path.isfile(_MANAGER_CONFIG_FILE):
+        return {}
+    try:
+        with open(_MANAGER_CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+_syncthing_cache = {"checked_at": 0.0, "result": None}
+
+
+def get_syncthing_status():
+    """
+    Answers exactly one question, per Architecture doc §5: is the
+    "sync-state" folder (the one holding host-state.json) actually in
+    sync right now. One REST call (GET /rest/db/status?folder=sync-state),
+    no transfer queues, no per-file progress, no device list — Syncthing
+    already has a correct GUI for that at 127.0.0.1:8384.
+
+    Response field meanings confirmed against Syncthing's own REST API
+    docs (docs.syncthing.net/rest/db-status-get.html) rather than
+    guessed: "state" is the folder's own reported state ("idle" when
+    caught up); "needFiles"/"needBytes" are what's still out of sync;
+    "pullErrors" is failed-sync count from the last operation.
+
+    Returns one of:
+        {"state": "not_configured"} — no manager_config.json, or no
+            "syncthing_api_key" key in it. Expected default, not an
+            error.
+        {"state": "in_sync"}
+        {"state": "syncing"}
+        {"state": "error", "detail": "..."} — covers both a Syncthing-
+            reported problem (pull errors / folder error state) and
+            this call itself failing (wrong port, Syncthing not
+            running, bad/revoked key) — one bucket on purpose, mirroring
+            how role_state already collapses several distinct problems
+            into CONFLICT/UNKNOWN rather than growing a field per cause.
+    """
+    now = time.time()
+    cached = _syncthing_cache["result"]
+    if cached is not None and now - _syncthing_cache["checked_at"] < _SYNCTHING_CHECK_MIN_INTERVAL_SECONDS:
+        return cached
+
+    def _cache_and_return(result):
+        _syncthing_cache["result"] = result
+        _syncthing_cache["checked_at"] = now
+        return result
+
+    config = _read_manager_config()
+    api_key = config.get("syncthing_api_key")
+    if not api_key:
+        return _cache_and_return({"state": "not_configured"})
+
+    base_url = config.get("syncthing_url", "http://127.0.0.1:8384").rstrip("/")
+    url = f"{base_url}/rest/db/status?folder={_SYNCTHING_FOLDER_ID}"
+    req = urllib.request.Request(url, headers={"X-API-Key": api_key})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return _cache_and_return({"state": "error", "detail": str(e)})
+
+    pull_errors = data.get("pullErrors", 0)
+    if pull_errors or data.get("state") == "error":
+        detail = f"{pull_errors} pull error(s)" if pull_errors else "folder error"
+        return _cache_and_return({"state": "error", "detail": detail})
+    if data.get("state") == "idle" and data.get("needFiles", 0) == 0 and data.get("needBytes", 0) == 0:
+        return _cache_and_return({"state": "in_sync"})
+    return _cache_and_return({"state": "syncing"})
 
 
 # ── process discovery ─────────────────────────────────────────────────
@@ -983,6 +1081,7 @@ class ManagerApi:
             "process": process_info,
             "role_state": role_state,
             "version": _read_local_version(),
+            "syncthing": get_syncthing_status(),
         }
 
     def start(self):
@@ -1394,6 +1493,16 @@ def _print_cli_report():
         if tp["hidden_count"]:
             print(f"  (+{tp['hidden_count']} infrastructure peer(s) hidden — no DNSName, likely Tailscale Funnel)")
 
+    print()
+    print("=== syncthing (sync-state folder) ===")
+    st = get_syncthing_status()
+    if st["state"] == "not_configured":
+        print("  not configured (no manager_config.json / syncthing_api_key)")
+    elif st["state"] == "error":
+        print(f"  ERROR — {st['detail']}")
+    else:
+        print(f"  {st['state']}")
+
 
 # ── System tray (§17 "not yet built": tray icon) ───────────────────────
 #
@@ -1408,50 +1517,15 @@ def _print_cli_report():
 
 def _select_tray_backend():
     """
-    Must run BEFORE `import pystray` — pystray resolves its backend
-    exactly once, at import time (`Icon = backend().Icon` in
-    pystray/__init__.py), not via a constructor kwarg afterward.
-
-    Windows: left alone. sys.platform == 'win32' is pystray's own
-    unconditional selector for the win32 backend — no ambiguity, no
-    action needed here.
-
-    Non-Windows (in practice: Arch, the dev/test machine — see
-    Architecture doc §12, this has never run anywhere else): forced to
-    "xorg" rather than letting pystray auto-probe appindicator -> gtk
-    -> xorg on its own. Confirmed empirically (2026-07-28, sandboxed
-    Linux env with no Gtk typelib installed): pystray's probe loop only
-    catches ImportError per candidate, but gi.require_version() raises
-    ValueError when a namespace is missing — so on a machine without
-    the AppIndicator3/Ayatana gi typelib (a SEPARATE package from the
-    webkit2gtk pywebview itself needs — see doc §3's dependency-cost
-    section, never confirmed installed), a bare `import pystray` can
-    crash outright instead of falling through to the next candidate.
-
-    xorg sidesteps that failure mode entirely — it's pure Xlib
-    (python-xlib), never touches gi/Gtk, so it can't hit that crash.
-    It also can't collide with pywebview's own Gtk.main() loop, which
-    the gtk/appindicator backends could (both would want to run their
-    own; see _build_tray_icon()'s docstring for the mirror-image case
-    that in fact doesn't collide, and why).
-
-    Traded away, and worth being honest about rather than burying:
-    pystray's xorg backend sets HAS_MENU = False (confirmed by reading
-    pystray/_xorg.py directly) — no right-click context menu on Linux,
-    only a single left-click default action (also confirmed: `_on_
-    button_press` there only fires for `event.detail == 1`, i.e. left
-    button). Every MenuItem below still gets built identically on both
-    platforms — no branching needed for that — because the "default
-    action" mechanism (Icon.__call__ -> Menu.__call__ picks whichever
-    item has default=True) is generic, backend-independent pystray
-    code, not something HAS_MENU gates. Windows gets the real menu;
-    Linux gets the icon plus "click it to raise the window," which
-    covers Start/Stop/Quit indirectly by getting the user back to a
-    window that already has all three. Acceptable given Arch isn't a
-    shipped target (doc §1); not acceptable to leave unstated.
-
-    Respects an already-set PYSTRAY_BACKEND (e.g. someone testing
-    appindicator by hand) rather than clobbering it.
+    Must be set before `import pystray` — it resolves its backend once,
+    at import time, not via a constructor kwarg. Windows: left alone
+    (win32 is pystray's own unconditional pick there). Non-Windows:
+    forced to "xorg" — letting pystray auto-probe appindicator/gtk
+    first can raise an uncaught ValueError on a box missing the Gtk
+    typelib (confirmed empirically), instead of falling through to the
+    next candidate. xorg is pure Xlib, sidesteps that, and can't
+    collide with pywebview's own Gtk.main() loop either. Dev/test only
+    (i3 + polybar — confirmed working); Windows is what actually ships.
     """
     if os.name != "nt":
         os.environ.setdefault("PYSTRAY_BACKEND", "xorg")
@@ -1586,16 +1660,9 @@ def _build_tray_icon(api, window):
 
     def _on_quit(icon, item):
         stop_polling.set()
-        # icon.stop() joins pystray's internal setup thread with a 5s
-        # timeout before giving up and logging a warning (pystray's own
-        # SETUP_THREAD_TIMEOUT). Observed directly: on a WM with no
-        # systray host at all, that thread can spend the full 5s
-        # retrying the dock and never cleanly finish -- Quit still
-        # completes (this call returns, window.destroy() below still
-        # runs), it's just up to 5s slower in that specific case. Not
-        # something fixable from this side; a WM with zero tray support
-        # means there's nowhere for the icon to go regardless.
-        icon.stop()
+        icon.stop()   # up to 5s slower if no systray host is running at
+                      # all (pystray's own SETUP_THREAD_TIMEOUT) — not
+                      # the case on i3+polybar, confirmed.
         window.destroy()
 
     menu = Menu(

@@ -61,7 +61,6 @@ const DOM_CAP        = 150;
 // exists purely to make the unread count/divider correct shouldn't pull
 // further back than the app would keep rendered anyway.
 const UNREAD_CATCHUP_CAP = DOM_CAP;
-const EDIT_WINDOW_MS = 15 * 60 * 1000; // must mirror server.py's EDIT_WINDOW_SECONDS
 
 let lastRenderedUser  = null;
 // [DEAD-CODE-REMOVED] `firstRenderedUser` was only ever assigned to, never read.
@@ -1230,15 +1229,7 @@ const NowPlaying = (() => {
 
     function current() { return active; }
 
-    function stopIfMessage(msgId) {
-        if (active && active.msgId === msgId) {
-            _safeCall(() => active.pause());
-            active = null;
-            Island.hide();
-        }
-    }
-
-    return { register, interrupt, notifyPlaying, notifyPaused, notifyEnded, current, stopIfMessage };
+    return { register, interrupt, notifyPlaying, notifyPaused, notifyEnded, current };
 })();
 
 // Bind a plain <audio> element (sent local-audio or ytdlp_audio bubble) as
@@ -2643,19 +2634,6 @@ function connectWebSocket() {
             return;
         }
 
-        if (msg.type === "edit") {
-            applyEditToDOM(msg.id, msg.value);
-            return;
-        }
-        if (msg.type === "delete") {
-            applyDeleteToDOM(msg.id);
-            return;
-        }
-        if (msg.type === "edit_rejected") {
-            showToast(msg.reason === "expired" ? "Edit window has expired." : "Couldn't save edit.");
-            return;
-        }
-
         // ── persisted events (regular messages + system join/leave) ───────
         appendMessage(msg);
         if (msg.type !== "system" && msg.user !== username &&
@@ -3304,20 +3282,6 @@ function showChat() {
             copyMessageText(copyBtn.closest(".message"));
             return;
         }
-        // Edit button → inline edit in place
-        const editBtn = e.target.closest(".edit-btn");
-        if (editBtn) {
-            e.stopPropagation();
-            beginInlineEdit(editBtn.closest(".message"));
-            return;
-        }
-        // Delete button → tap-to-arm, tap-again-to-confirm
-        const deleteBtn = e.target.closest(".delete-btn");
-        if (deleteBtn) {
-            e.stopPropagation();
-            handleDeleteClick(deleteBtn, deleteBtn.closest(".message")?.dataset.msgid);
-            return;
-        }
         // Reply quote → jump to original
         const replyQuote = e.target.closest(".reply-quote");
         if (replyQuote?.dataset.replyId) {
@@ -3518,201 +3482,6 @@ function closeMediaViewer(e) {
 // [SEC] Every user-supplied value is now escaped or DOM-inserted safely.
 // [REFACTOR] Split into a few smaller builders so this function reads top-to-bottom
 // as a single flow, matching the mental model of "what kind of bubble am I building?"
-// ── Message edit & delete ────────────────────────────────────────────────
-// No version/audit log by design — edit overwrites in place, delete
-// replaces content with a tombstone. Both are WS round-trips so every
-// connected client (including the sender's own other tabs) updates from
-// one authoritative broadcast, no page refresh involved.
-
-function isEditWindowExpired(timestamp) {
-    const sentAt = Date.parse(timestamp);
-    if (!Number.isFinite(sentAt)) return true;
-    return Date.now() - sentAt > EDIT_WINDOW_MS;
-}
-
-function formatRemaining(ms) {
-    const totalSec = Math.max(0, Math.ceil(ms / 1000));
-    const m = Math.floor(totalSec / 60);
-    const s = totalSec % 60;
-    return m > 0 ? `Editable for ${m}m ${s}s` : `Editable for ${s}s`;
-}
-
-// Shared by every bubble builder so copy/edit/delete never drift into
-// per-type reimplementations. allowEdit is opt-in per type (plain text:
-// always; file: only if it already has a caption; sticker/youtube/ytdlp:
-// never — no editable field exists for them in this UI).
-function buildMessageActionsHTML(msg, { allowEdit = false } = {}) {
-    if (msg.deleted) return "";
-    const isOwn = msg.user === username;
-    const msgId = escapeHTML(msg.id || "");
-    let html = `<div class="msg-actions">`;
-    html += `<button class="copy-btn" title="Copy message" aria-label="Copy message"><span class="icon copy"></span></button>`;
-    if (isOwn && allowEdit && !isEditWindowExpired(msg.timestamp)) {
-        html += `<button class="edit-btn" title="Edit message" aria-label="Edit message" data-msgid="${msgId}"><span class="icon edit"></span></button>`;
-    }
-    if (isOwn) {
-        html += `<button class="delete-btn" title="Delete message" aria-label="Delete message" data-msgid="${msgId}"><span class="icon trash"></span></button>`;
-    }
-    html += `</div>`;
-    return html;
-}
-
-// ── inline edit ────────────────────────────────────────────────────────
-// The existing .bubble-text/.bubble-caption node becomes contenteditable
-// in place — no overlay, no swapped wrapper, nothing else in the message
-// (or the rest of the chat) reflows. Only one edit session at a time.
-let _activeEdit = null; // { msgEl, textEl, field, original, msgId, sentTs, metaEl, timer }
-
-function beginInlineEdit(msgEl) {
-    if (_activeEdit) saveInlineEdit();
-    const textEl = msgEl.querySelector(".bubble-text, .bubble-caption");
-    if (!textEl) return;
-    const field = textEl.classList.contains("bubble-caption") ? "caption" : "text";
-    const original = textEl.textContent;
-    const msgId = msgEl.dataset.msgid;
-    const sentTs = msgEl.dataset.ts;
-
-    msgEl.classList.add("is-editing");
-    textEl.contentEditable = "true";
-    textEl.classList.add("editing");
-
-    const metaEl = document.createElement("div");
-    metaEl.className = "edit-meta";
-    metaEl.innerHTML =
-        `<span class="edit-remaining"></span>` +
-        `<span class="edit-hint">Enter to save · Esc to cancel</span>`;
-    textEl.insertAdjacentElement("afterend", metaEl);
-
-    _activeEdit = { msgEl, textEl, field, original, msgId, sentTs, metaEl, timer: null };
-
-    const remainEl = metaEl.querySelector(".edit-remaining");
-    const tick = () => {
-        const msLeft = EDIT_WINDOW_MS - (Date.now() - Date.parse(sentTs));
-        if (msLeft <= 0) { showToast("Edit window has expired."); cancelInlineEdit(); return; }
-        remainEl.textContent = formatRemaining(msLeft);
-    };
-    tick();
-    _activeEdit.timer = setInterval(tick, 1000);
-
-    const range = document.createRange();
-    range.selectNodeContents(textEl);
-    range.collapse(false);
-    const sel = window.getSelection();
-    sel.removeAllRanges();
-    sel.addRange(range);
-    textEl.focus();
-
-    textEl.addEventListener("keydown", onEditKeydown);
-    document.addEventListener("click", onEditOutsideClick, { capture: true });
-}
-
-function onEditKeydown(e) {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); saveInlineEdit(); }
-    else if (e.key === "Escape") { e.preventDefault(); cancelInlineEdit(); }
-}
-
-function onEditOutsideClick(e) {
-    if (!_activeEdit) return;
-    if (_activeEdit.textEl.contains(e.target) || _activeEdit.metaEl.contains(e.target)) return;
-    saveInlineEdit(); // clicking away saves, matching normal editable-field expectations
-}
-
-function endInlineEdit() {
-    if (!_activeEdit) return;
-    const { msgEl, textEl, metaEl, timer } = _activeEdit;
-    clearInterval(timer);
-    textEl.removeEventListener("keydown", onEditKeydown);
-    document.removeEventListener("click", onEditOutsideClick, { capture: true });
-    textEl.contentEditable = "false";
-    textEl.classList.remove("editing");
-    msgEl.classList.remove("is-editing");
-    metaEl.remove();
-    _activeEdit = null;
-}
-
-function cancelInlineEdit() {
-    if (!_activeEdit) return;
-    _activeEdit.textEl.textContent = _activeEdit.original;
-    endInlineEdit();
-}
-
-function saveInlineEdit() {
-    if (!_activeEdit) return;
-    const { textEl, original, msgId } = _activeEdit;
-    const newVal = textEl.innerText.trim();
-    if (!newVal) { showToast("Message can't be empty — delete it instead."); return; }
-    if (newVal === original) { cancelInlineEdit(); return; }
-    if (!socket || socket.readyState !== 1) { showToast("Not connected."); return; }
-    socket.send(JSON.stringify({ type: "edit", id: msgId, text: newVal }));
-    textEl.textContent = original; // revert; the WS echo (near-instant, same LAN) applies the real update
-    endInlineEdit();
-}
-
-// ── delete: tap-to-arm, tap-again-to-confirm ─────────────────────────────
-let _pendingDeleteConfirm = null; // { btn, timer }
-
-function handleDeleteClick(btn, msgId) {
-    if (!msgId) return;
-    if (_pendingDeleteConfirm && _pendingDeleteConfirm.btn === btn) {
-        clearTimeout(_pendingDeleteConfirm.timer);
-        _pendingDeleteConfirm = null;
-        btn.classList.remove("confirm-armed");
-        if (socket && socket.readyState === 1) {
-            socket.send(JSON.stringify({ type: "delete", id: msgId }));
-        }
-        return;
-    }
-    resetDeleteConfirm();
-    btn.classList.add("confirm-armed");
-    btn.setAttribute("aria-label", "Confirm delete");
-    btn.title = "Click again to delete";
-    const timer = setTimeout(resetDeleteConfirm, 3500);
-    _pendingDeleteConfirm = { btn, timer };
-}
-
-function resetDeleteConfirm() {
-    if (!_pendingDeleteConfirm) return;
-    clearTimeout(_pendingDeleteConfirm.timer);
-    _pendingDeleteConfirm.btn.classList.remove("confirm-armed");
-    _pendingDeleteConfirm.btn.setAttribute("aria-label", "Delete message");
-    _pendingDeleteConfirm.btn.title = "Delete message";
-    _pendingDeleteConfirm = null;
-}
-
-// ── applying broadcasts (own tab included — see WS handler) ─────────────
-function applyEditToDOM(id, value) {
-    const msgEl = document.querySelector(`[data-msgid="${CSS.escape(id)}"]`);
-    if (!msgEl) return; // scrolled out of the DOM_CAP window — fine, matches history's own risk tolerance
-    const textEl = msgEl.querySelector(".bubble-text, .bubble-caption");
-    if (!textEl) return;
-    textEl.innerHTML = formatMessage(value);
-    msgEl.dataset.previewText = value;
-    if (!msgEl.querySelector(".edited-badge")) {
-        const badge = document.createElement("span");
-        badge.className = "edited-badge";
-        badge.textContent = "(edited)";
-        msgEl.querySelector(".timestamp")?.insertAdjacentElement("beforebegin", badge);
-    }
-    msgEl.classList.remove("highlight-flash");
-    void msgEl.offsetWidth;
-    msgEl.classList.add("highlight-flash");
-    setTimeout(() => msgEl.classList.remove("highlight-flash"), 1100);
-}
-
-function applyDeleteToDOM(id) {
-    const msgEl = document.querySelector(`[data-msgid="${CSS.escape(id)}"]`);
-    if (!msgEl) return;
-    if (_activeEdit && _activeEdit.msgId === id) cancelInlineEdit();
-    NowPlaying.stopIfMessage(id);
-    AnimatedMedia.release(msgEl);
-    const bubble = msgEl.querySelector(".bubble, .bubble-file, .bubble-audio, .bubble-sticker, .bubble-youtube");
-    msgEl.classList.add("message--deleted");
-    if (bubble) {
-        bubble.className = "bubble bubble-deleted";
-        bubble.innerHTML = `<span class="bubble-text deleted-text">Message deleted</span>`;
-    }
-}
-
 function buildMessageEl(msg, prevUser) {
     if (msg.type === "system") return buildSystemMessageEl(msg);
     const div = document.createElement("div");
@@ -3722,7 +3491,6 @@ function buildMessageEl(msg, prevUser) {
     div.dataset.msgid = msgId;
     div.dataset.user  = msg.user;
     div.dataset.ts    = msg.timestamp || "";
-    if (msg.deleted) div.classList.add("message--deleted");
 
     const sameUser = prevUser === msg.user;
     if (msg.user === username) div.classList.add("own-message");
@@ -3732,13 +3500,7 @@ function buildMessageEl(msg, prevUser) {
     const replyHTML = buildReplyQuoteHTML(msg.replyTo);
 
     let bubbleHTML;
-    if (msg.deleted) {
-        div.dataset.previewText = "";
-        bubbleHTML = `<div class="bubble bubble-deleted">` + replyHTML +
-            `<span class="bubble-text deleted-text">Message deleted</span>` +
-            `<span class="timestamp">${escapeHTML(shortTime)}</span>` +
-            `</div>`;
-    } else if (msg.type === "file") {
+    if (msg.type === "file") {
         bubbleHTML = buildFileBubbleHTML(msg, replyHTML, shortTime, div);
     } else if (msg.type === "youtube") {
         bubbleHTML = buildYouTubeBubbleHTML(msg, replyHTML, shortTime, div);
@@ -3750,9 +3512,13 @@ function buildMessageEl(msg, prevUser) {
         bubbleHTML =
             `<div class="bubble">` + replyHTML +
             `<span class="bubble-text">${formatMessage(msg.text)}</span>` +
-            (msg.edited ? `<span class="edited-badge">(edited)</span>` : "") +
             `<span class="timestamp">${escapeHTML(shortTime)}</span>` +
-            buildMessageActionsHTML(msg, { allowEdit: true }) +
+            // No inline onclick — delegated handler in showChat() dispatches this.
+            // [REBOOT] Copy affordance is an SVG icon. The icon swaps to a
+            // check SVG on successful copy (handled in copyMessageText).
+            `<button class="copy-btn" title="Copy message" aria-label="Copy message">` +
+              `<span class="icon copy"></span>` +
+            `</button>` +
             `</div>`;
     }
 
@@ -3819,9 +3585,7 @@ function buildYouTubeBubbleHTML(msg, replyHTML, shortTime, div) {
         `<div class="yt-bubble-channel-row">` +
         `<span class="yt-bubble-channel">${safeChannel}</span>` +
         `<span class="timestamp">${safeTime}</span>` +
-        `</div></div>` +
-        buildMessageActionsHTML(msg, { allowEdit: false }) +
-        `</div>`;
+        `</div></div></div>`;
 }
 
 // ── yt-dlp audio bubble ─────────────────────────────────────────────────
@@ -3854,9 +3618,7 @@ function buildYtdlpAudioBubbleHTML(msg, replyHTML, shortTime, div) {
         `data-ytdlp-status-label="Resolving sent audio…" ` +
         `data-np-kind="ytdlp" data-np-title="${escapeHTML(title)}" data-np-subtitle="${safeChannel}"${npThumbAttr}></audio>` +
         `</div></div>` +
-        (msg.edited ? `<span class="edited-badge">(edited)</span>` : "") +
         `<div class="timestamp timestamp-block">${safeTime}</div>` +
-        buildMessageActionsHTML(msg, { allowEdit: false }) +
         `</div>`;
 }
 
@@ -3871,18 +3633,12 @@ function buildFileBubbleHTML(msg, replyHTML, shortTime, div) {
     const captionHtml = msg.caption
         ? `<div class="bubble-caption">${formatMessage(msg.caption)}</div>`
         : "";
-    const editedHtml = msg.edited ? `<span class="edited-badge">(edited)</span>` : "";
     const safeName   = escapeHTML(displayName);
     const safeTime   = escapeHTML(shortTime);
     // [SEC] safeMediaURL guarantees http(s) or same-origin path.
     const rawSrc     = msg.filename.startsWith("http") ? msg.filename : `/uploads/${msg.filename}`;
     const finalSrc   = safeMediaURL(rawSrc);
     const finalSrcE  = escapeHTML(finalSrc);
-    // Editing only applies to messages that already carry a caption — no
-    // caption-add-on-edit flow, keeps the edit affordance scoped to "edit
-    // existing text," matching the plain-text case.
-    const captionActions   = buildMessageActionsHTML(msg, { allowEdit: !!msg.caption });
-    const noCaptionActions = buildMessageActionsHTML(msg, { allowEdit: false });
 
     if (msg.isSticker) {
         const isVideoSticker = /\.(mp4|webm|mov)$/i.test(msg.filename);
@@ -3908,7 +3664,6 @@ function buildFileBubbleHTML(msg, replyHTML, shortTime, div) {
         return `<div class="bubble bubble-sticker">` + replyHTML +
                stickerMedia +
                `<div class="timestamp timestamp-block">${safeTime}</div>` +
-               noCaptionActions +
                `</div>`;
     }
 
@@ -3919,17 +3674,15 @@ function buildFileBubbleHTML(msg, replyHTML, shortTime, div) {
                    `<div class="gif-container">` +
                    `<img data-src="${finalSrcE}" src="" class="chat-image lazy-img is-gif-element" ` +
                    `data-viewer-src="${finalSrcE}" data-viewer-type="image" decoding="async">` +
-                   `</div>` + captionHtml + editedHtml +
+                   `</div>` + captionHtml +
                    `<div class="timestamp timestamp-block">${safeTime}</div>` +
-                   captionActions +
                    `</div>`;
         }
         return `<div class="bubble bubble-file">` + replyHTML +
                `<img data-src="${finalSrcE}" src="" class="chat-image lazy-img" ` +
                `data-viewer-src="${finalSrcE}" data-viewer-type="image" decoding="async">` +
-               captionHtml + editedHtml +
+               captionHtml +
                `<div class="timestamp timestamp-block">${safeTime}</div>` +
-               captionActions +
                `</div>`;
     }
 
@@ -3944,9 +3697,8 @@ function buildFileBubbleHTML(msg, replyHTML, shortTime, div) {
                     `<span class="icon play xl"></span>` +
                     `<span class="video-name">${safeName}</span>` +
                `</div>` +
-               captionHtml + editedHtml +
+               captionHtml +
                `<div class="timestamp timestamp-block">${safeTime}</div>` +
-               captionActions +
                `</div>`;
     }
 
@@ -3957,9 +3709,8 @@ function buildFileBubbleHTML(msg, replyHTML, shortTime, div) {
                `<span class="audio-name">${safeName}</span>` +
                `<audio src="${finalSrcE}" controls class="chat-audio" preload="none" ` +
                `data-np-kind="audio" data-np-title="${safeName}" data-np-subtitle="${escapeHTML(msg.user || "")}"></audio>` +
-               `</div></div>` + captionHtml + editedHtml +
+               `</div></div>` + captionHtml +
                `<div class="timestamp timestamp-block">${safeTime}</div>` +
-               captionActions +
                `</div>`;
     }
 
@@ -3970,8 +3721,7 @@ function buildFileBubbleHTML(msg, replyHTML, shortTime, div) {
              `<span class="icon file sm"></span>` +
              `<span>${safeName}</span>` +
            `</a>` +
-           captionHtml + `</div>` + editedHtml + `<span class="timestamp">${safeTime}</span>` +
-           captionActions +
+           captionHtml + `</div><span class="timestamp">${safeTime}</span>` +
            `</div>`;
 }
 

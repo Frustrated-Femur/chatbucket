@@ -476,50 +476,13 @@ _users_lock     = threading.Lock()
 
 # ── disk helpers ──────────────────────────────────────────────────────
 
-def _msg_id_to_path(msg_id):
-    safe_id = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(msg_id or secrets.token_hex(8)))
-    return os.path.join("messages", f"{safe_id}.json")
-
-
 def _write_message(msg):
     """Write a single message as its own JSON file."""
-    fpath = _msg_id_to_path(msg.get("id"))
+    safe_id = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(msg.get("id", secrets.token_hex(8))))
+    fpath = os.path.join("messages", f"{safe_id}.json")
     with _file_lock:
         with open(fpath, "w", encoding="utf-8") as f:
             json.dump(msg, f)
-
-
-def _read_message_by_id(msg_id):
-    """Read a single message file by id. Returns None if missing/corrupt —
-    never raises, since a missing/bad id from a delete/edit request should
-    just be a silent no-op, not a crash."""
-    try:
-        with open(_msg_id_to_path(msg_id), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-EDIT_WINDOW_SECONDS = 15 * 60  # requested range was 15-20 min; 15 is the default
-
-
-def _delete_uploaded_file_for(msg):
-    """Best-effort removal of the underlying uploaded file when a 'file'
-    message is deleted. Never fatal — an already-gone file, or a filename
-    that's actually a remote URL (defensive; the current upload flow
-    always uploads first, so this shouldn't happen), just means there's
-    nothing local left to clean up."""
-    if msg.get("type") != "file":
-        return
-    filename = msg.get("filename") or ""
-    if not filename or filename.startswith("http"):
-        return
-    fpath = os.path.join(UPLOAD_FOLDER, filename)
-    try:
-        if os.path.isfile(fpath):
-            os.remove(fpath)
-    except OSError:
-        pass
 
 def _write_youtube_meta(msg):
     """
@@ -815,67 +778,6 @@ def websocket(ws):
             # history renderer on next page load.)
             if msg_type in ("typing", "status"):
                 _broadcast(json.dumps(msg), exclude=ws)
-                continue
-
-            if msg_type == "delete":
-                target_id = msg.get("id")
-                target = _read_message_by_id(target_id) if target_id else None
-                if target is None or target.get("deleted") or target.get("user") != username:
-                    # Unknown id, already deleted, or not the owner — the
-                    # client only ever shows the delete button on the
-                    # sender's own messages, so a mismatch here is either a
-                    # stale UI or a crafted request. Either way: no-op.
-                    continue
-                _delete_uploaded_file_for(target)
-                tombstone = {
-                    "id": target_id,
-                    "type": target.get("type", "text"),
-                    "user": target["user"],
-                    "timestamp": target["timestamp"],
-                    "time": target.get("time", ""),
-                    "deleted": True,
-                }
-                _write_message(tombstone)
-                _broadcast(json.dumps({"type": "delete", "id": target_id}))
-                continue
-
-            if msg_type == "edit":
-                target_id = msg.get("id")
-                new_text = (msg.get("text") or "").strip()
-                target = _read_message_by_id(target_id) if target_id else None
-
-                if target is None or target.get("deleted") or target.get("user") != username:
-                    continue
-
-                # Editable content types only — stickers/YouTube/ytdlp shares
-                # have no free-text field the UI ever lets you touch.
-                msg_kind = target.get("type")
-                if target.get("isSticker") or msg_kind in ("youtube", "ytdlp_audio"):
-                    continue
-
-                field = "caption" if msg_kind == "file" else "text"
-                if not new_text and field == "text":
-                    continue  # empty text isn't a valid edit — delete instead
-
-                try:
-                    sent_at = datetime.fromisoformat(target["timestamp"])
-                except (KeyError, ValueError, TypeError):
-                    continue
-                if (datetime.now() - sent_at).total_seconds() > EDIT_WINDOW_SECONDS:
-                    _safe_send(ws, json.dumps({
-                        "type": "edit_rejected", "id": target_id, "reason": "expired",
-                    }))
-                    continue
-
-                if target.get(field, "") == new_text:
-                    continue  # no-op edit — nothing changed, nothing to broadcast
-
-                target[field] = new_text
-                target["edited"] = True
-                _write_message(target)
-                _broadcast(json.dumps({
-                    "type": "edit", "id": target_id, "field": field, "value": new_text,
-                }))
                 continue
 
             now = datetime.now()

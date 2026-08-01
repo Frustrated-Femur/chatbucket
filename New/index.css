@@ -130,8 +130,6 @@ h1 { margin-top: 0; letter-spacing: -0.02em; }
 .icon.add         { -webkit-mask-image: url(/static/icons/add.svg);         mask-image: url(/static/icons/add.svg); }
 .icon.pause       { -webkit-mask-image: url(/static/icons/pause.svg);       mask-image: url(/static/icons/pause.svg); }
 .icon.music       { -webkit-mask-image: url(/static/icons/music.svg);       mask-image: url(/static/icons/music.svg); }
-.icon.edit  { -webkit-mask-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGhlaWdodD0iMjRweCIgdmlld0JveD0iMCAwIDI0IDI0IiB3aWR0aD0iMjRweCIgZmlsbD0iI2UzZTNlMyI+PHBhdGggZD0iTTMgMTcuMjVWMjFoMy43NUwxNy44MSA5Ljk0bC0zLjc1LTMuNzVMMyAxNy4yNXpNMjAuNzEgNy4wNGMuMzktLjM5LjM5LTEuMDIgMC0xLjQxbC0yLjM0LTIuMzRhLjk5Ni45OTYgMCAwIDAtMS40MSAwbC0xLjgzIDEuODMgMy43NSAzLjc1IDEuODMtMS44M3oiLz48L3N2Zz4="); mask-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGhlaWdodD0iMjRweCIgdmlld0JveD0iMCAwIDI0IDI0IiB3aWR0aD0iMjRweCIgZmlsbD0iI2UzZTNlMyI+PHBhdGggZD0iTTMgMTcuMjVWMjFoMy43NUwxNy44MSA5Ljk0bC0zLjc1LTMuNzVMMyAxNy4yNXpNMjAuNzEgNy4wNGMuMzktLjM5LjM5LTEuMDIgMC0xLjQxbC0yLjM0LTIuMzRhLjk5Ni45OTYgMCAwIDAtMS40MSAwbC0xLjgzIDEuODMgMy43NSAzLjc1IDEuODMtMS44M3oiLz48L3N2Zz4="); }
-.icon.trash { -webkit-mask-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGhlaWdodD0iMjRweCIgdmlld0JveD0iMCAwIDI0IDI0IiB3aWR0aD0iMjRweCIgZmlsbD0iI2UzZTNlMyI+PHBhdGggZD0iTTYgMTljMCAxLjEuOSAyIDIgMmg4YzEuMSAwIDItLjkgMi0yVjdINnYxMnpNMTkgNGgtMy41bC0xLTFoLTVsLTEgMUg1djJoMTRWNHoiLz48L3N2Zz4="); mask-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGhlaWdodD0iMjRweCIgdmlld0JveD0iMCAwIDI0IDI0IiB3aWR0aD0iMjRweCIgZmlsbD0iI2UzZTNlMyI+PHBhdGggZD0iTTYgMTljMCAxLjEuOSAyIDIgMmg4YzEuMSAwIDItLjkgMi0yVjdINnYxMnpNMTkgNGgtMy41bC0xLTFoLTVsLTEgMUg1djJoMTRWNHoiLz48L3N2Zz4="); }
 
 /* When the browser can't resolve the mask-image (very old fallback), the
    .icon renders as an invisible box — the ARIA label still communicates
@@ -663,115 +661,67 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     user-select: none;
 }
 
-/* Message action cluster (copy / edit / delete) — hover-revealed in the
-   bubble's top-right corner, same corner .copy-btn always lived in.
-   Generalized to a single container so every bubble type (text/file/
-   sticker/audio/youtube) wires the same three buttons the same way,
-   instead of each type reinventing its own action row. */
-.msg-actions {
+/* Copy button (delegated click, defined in app.js). Rendered as icon-only. */
+.copy-btn {
     position: absolute;
     top: 4px;
     right: 4px;
-    display: flex;
-    gap: 2px;
     opacity: 0;
     background: rgba(0,0,0,0.75);
     border: 1px solid var(--border-2);
     border-radius: var(--radius-xs);
-    padding: 2px;
-    z-index: 2;
-    transition: opacity var(--dur-fast) ease;
-}
-.bubble:hover .msg-actions,
-.bubble-file:hover .msg-actions,
-.bubble-audio:hover .msg-actions,
-.bubble-sticker:hover .msg-actions,
-.bubble-youtube:hover .msg-actions {
-    opacity: 1;
-}
-.msg-actions button {
-    background: transparent;
-    border: none;
     padding: 4px;
     cursor: pointer;
     color: var(--text-2);
     line-height: 0;
-    border-radius: 4px;
-    transition: color var(--dur-fast) ease, background var(--dur-fast) ease;
+    z-index: 2;
+    transition: opacity var(--dur-fast) ease, color var(--dur-fast) ease, background var(--dur-fast) ease;
 }
-.msg-actions button:hover  { color: var(--text); background: rgba(255,255,255,0.08); }
-.msg-actions .icon         { width: 13px; height: 13px; color: inherit; }
-.msg-actions .copy-btn.copied .icon { color: var(--success); }
+.bubble:hover .copy-btn { opacity: 1; }
+.copy-btn:hover         { color: var(--text); background: rgba(0,0,0,0.9); }
+.copy-btn .icon         { width: 13px; height: 13px; color: inherit; }
 
-/* Delete: tap-to-arm, tap-again-to-confirm — no blocking dialog. */
-.msg-actions .delete-btn.confirm-armed {
-    background: var(--danger);
-    color: #fff;
-    animation: delete-armed-pulse 900ms ease-in-out infinite;
-}
-@keyframes delete-armed-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(255,107,107,0.5); }
-    50%      { box-shadow: 0 0 0 4px rgba(255,107,107,0); }
-}
+.copy-btn.copied        { opacity: 1; }
+.copy-btn.copied .icon  { color: var(--success); }
 
-/* Touch devices never get :hover — same permanently-dim treatment the
-   old .copy-btn already used there, just applied to the whole cluster. */
+/* [FIX] Copied-state must win regardless of hover — otherwise the
+   checkmark can disappear the instant the pointer leaves the bubble,
+   before it's been seen. .copy-btn.copied (2 classes) outranks
+   .bubble:hover .copy-btn on specificity either way, so this applies
+   whether or not the mouse is still over the bubble. */
+
+/* Devices whose primary input can't hover at all (touchscreens) never get
+   a :hover state to reveal this button — without this it's permanently
+   invisible there, not just harder to find. Kept dimmer than the
+   hovered/copied state so it doesn't compete with bubble content on
+   small screens. */
 @media (hover: none) {
-    .msg-actions { opacity: 0.55; }
+    .copy-btn {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    opacity: 0;
+    background: rgba(0,0,0,0.75);
+    border: 1px solid var(--border-2);
+    border-radius: var(--radius-xs);
+    padding: 4px;
+    cursor: pointer;
+    color: var(--text-2);
+    line-height: 0;
+    z-index: 2;
+    transition: opacity var(--dur-fast) ease, color var(--dur-fast) ease, background var(--dur-fast) ease;
 }
+.bubble:hover .copy-btn { opacity: 1; }
+.copy-btn:hover         { color: var(--text); background: rgba(0,0,0,0.9); }
+.copy-btn .icon         { width: 13px; height: 13px; color: inherit; }
 
-/* "(edited)" marker — a flag, not a version log; no prior text is kept. */
-.edited-badge {
-    font-size: 10px;
-    color: var(--text-3);
-    font-style: italic;
-    margin-right: 4px;
-    user-select: none;
-}
-
-/* Deleted tombstone — same node, same slot, content swapped. Compositor-
-   only entrance (opacity/scale), never a layout/height animation, so a
-   delete never reflows neighboring messages. */
-.bubble-deleted {
-    opacity: 0.6;
-    animation: bubble-deleted-in 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-.deleted-text { font-style: italic; color: var(--text-3); }
-@keyframes bubble-deleted-in {
-    from { opacity: 0; transform: scale(0.97); }
-    to   { opacity: 0.6; transform: scale(1); }
-}
-
-/* Inline edit mode — the existing .bubble-text/.bubble-caption node itself
-   becomes contenteditable in place; nothing is swapped out, nothing else
-   in the message reflows. */
-.bubble-text.editing,
-.bubble-caption.editing {
-    outline: 1px dashed var(--border-3);
-    outline-offset: 3px;
-    border-radius: 4px;
-    background: rgba(255,255,255,0.03);
-    cursor: text;
-}
-.edit-meta {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    margin-top: 6px;
-    font-size: 10.5px;
-    color: var(--text-3);
-}
-.edit-remaining { font-variant-numeric: tabular-nums; }
-.edit-hint { opacity: 0.7; }
-@media (max-width: 640px) {
-    .edit-hint { display: none; }
+.copy-btn.copied        { opacity: 1; }
+.copy-btn.copied .icon  { color: var(--success); }
 }
 
 /* image bubbles */
 .bubble-file {
     display: inline-block;
-    position: relative;
     padding: 6px;
     background: var(--surface-2);
     border-radius: var(--radius-md);
@@ -814,7 +764,6 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
 /* audio bubbles */
 .bubble-audio {
     display: inline-flex;
-    position: relative;
     flex-direction: column;
     gap: 8px;
     max-width: 440px;
@@ -1451,7 +1400,6 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
    discipline). On click: swapped in-place for a live YT.Player. */
 .bubble-youtube {
     display: inline-flex;
-    position: relative;
     flex-direction: column;
     max-width: 340px;
     background: var(--surface-2);
@@ -1558,7 +1506,6 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
 
 /* ── stickers ──────────────────────────────────────────────────────────── */
 .bubble-sticker {
-    position: relative;
     background: transparent !important;
     padding: 0 !important;
     border: none !important;

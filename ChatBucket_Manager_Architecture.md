@@ -64,6 +64,14 @@ Consequence: **the Manager must be a Python process.** Treated as a constraint t
 - **Process status** — running/stopped, PID, uptime.
 - **Syncthing API key handling** — requires a one-time manual copy of the API key from Syncthing's `config.xml` (`~/.config/syncthing` on Linux, `%LOCALAPPDATA%\Syncthing` on Windows) into the Manager's own config. Real, non-zero setup friction — budgeted honestly, not treated as "just an API call."
 
+**Implemented 2026-07-29.** The Manager's own config is `manager_config.json`:
+```json
+{"syncthing_api_key": "...", "syncthing_url": "http://127.0.0.1:8384"}
+```
+`syncthing_url` is optional (defaults as shown). Missing file or missing key is the expected out-of-the-box state (`"not_configured"`), not an error. One call, `GET /rest/db/status?folder=sync-state`, throttled to at most once per 30s independent of the window's own 15s poll — Syncthing's own REST docs flag that endpoint as expensive CPU/RAM-wise and say to use it sparingly.
+
+**Placement: repo root, not `manager/`.** `manager/`'s update mechanism (§14) moves that whole directory into `.update-backup/` on every update (a directory-level match, not a per-file check) — a file living inside it would silently vanish after the user's very first update, since the release archive never contains a `manager_config.json` to extract back. A repo-root file named neither `VERSION` nor ending in `.py`/`.txt` is invisible to both the backup-move and the extraction allow-list, so no changes to §14's logic were needed to keep it safe.
+
 **Known gap this depends on (not fixed here):** `ChatBucket_Networking_Architecture.md` §9 lists the Syncthing-synced folders as `sync-state`/`sync-mess`/`sync-gifs`/`sync-sticker`/`sync-uploads` — five folders. `sfx/` (local music) and `presence/` are not on that list. If `sfx/` isn't actually synced, a file uploaded while one machine is host silently doesn't exist when another machine later becomes host — and the Manager's Syncthing-status field would report "in sync" while missing that this folder was never configured to sync at all. This is a gap in the Networking doc, surfaced here because it affects what this doc's filesystem/status sections can promise; fix belongs in that document, not this one.
 
 ---
@@ -108,6 +116,7 @@ All three machines (Arch, Win1, Win2) may run the Manager. Arch is the primary d
 C:\Users\<name>\ChatBucket\
 ├── .venv\                   ← single shared virtualenv, see §11
 ├── VERSION                  ← plain-text version string, read by §14's update check
+├── manager_config.json      ← user-created, not shipped; Syncthing API key, see §5
 ├── requirements.txt         ← ChatBucket server core deps
 ├── requirements-manager.txt ← Manager-only deps
 ├── requirements-prod-posix.txt  ← optional, POSIX-only (gunicorn/gevent), not installed on Windows
@@ -163,7 +172,12 @@ yt-dlp
 **`requirements-manager.txt`** (Manager only):
 ```
 pywebview
+pystray
+Pillow
+python-xlib
 ```
+`python-xlib` backs pystray's `xorg` backend, forced there deliberately on Linux (see the tray icon's `_select_tray_backend()`) — never imported on Windows, since that platform uses pystray's separate `win32` backend instead. Included unconditionally rather than forked into a Linux-only file: it's pure Python (confirmed via its own PyPI page — no C extension, explicitly written that way for portability to non-Unix systems), so it installs cleanly and harmlessly on Windows too, just unused there.
+
 Note: the Manager imports `arbitration.py`/`host_state.py` directly (§4) but neither of those modules imports Flask or anything server-side — the Manager genuinely does not need `requirements.txt`'s contents to function, only its own.
 
 **`requirements-prod-posix.txt`** (optional, POSIX only — not installed by the Windows bootstrap script at all):
@@ -296,8 +310,11 @@ UI: buttons swap to a spinner + "Starting…"/"Stopping…" while their call is 
 - `manager/manager_main.py` — implements `get_host_state()`, `get_claimed_host_status()`, `get_tailnet_peers()`, plus a `ManagerApi` class exposing `get_status()` via pywebview's `js_api`. Dual entrypoint: `--cli` (stdout probe, no window) and default (opens the real window). The `--cli` path is kept permanently, not just during bring-up — every bug found in this module so far was caught faster reading plain stdout than it would have been through the rendered UI.
 - `manager/web/index.html` — working frontend: role badge (HOST/CLIENT/IDLE), claimed-host reachability, dynamic tailnet peer list, manual refresh + 15s auto-refresh. Styled with ChatBucket's own `index.css` token values (dark surface stack, `--success`/offline status-dot convention) per §15.
 - `window_check.py` — minimal literal pywebview window-open/close test, used to verify the GTK backend renders (not just imports) before the real UI was built on top of it.
+- Start/Stop process control, with Windows graceful-shutdown handling (`CREATE_NEW_PROCESS_GROUP`/`CTRL_BREAK_EVENT`) and `psutil`-based already-running detection — see §6, §16.6.
+- **Tray icon (2026-07-28).** `pystray`, colored per role state (mirrors `index.css` tokens), full Show/Start/Stop/Quit menu on Windows. Forces `PYSTRAY_BACKEND=xorg` on Linux (dev/test only — see `_select_tray_backend()`); confirmed rendering correctly on the actual dev machine (i3 + polybar).
+- **Syncthing status (2026-07-29).** See §5 for the endpoint/config/placement detail. Code-complete and tested against a mock server reproducing Syncthing's real REST response shape; **not yet exercised against a live Syncthing instance** (no `manager_config.json` populated on the dev machine yet) — same "not yet Windows-tested" honesty this doc already applies elsewhere, not glossed over here either.
 
-**Not yet built:** Start/Stop process control, Windows graceful-shutdown handling (`CREATE_NEW_PROCESS_GROUP`/`CTRL_BREAK_EVENT`) — written nowhere yet, `psutil`-based already-running detection, tray icon (`pystray` installed, unused so far), Syncthing status integration, PowerShell bootstrap script, GitHub Actions test workflow, `VERSION` file.
+**Not yet built:** PowerShell bootstrap script, GitHub Actions test workflow, `VERSION` file.
 
 **Open question surfaced during the build, not yet resolved:** a real Windows machine (not Win1/Win2, a different personal device) was discovered reachable on the tailnet mid-build. Whether it's available as an actual Windows test target — rather than relying solely on GitHub Actions `windows-latest` runners per §12 — is undecided and changes how much confidence the eventual Windows-specific code (shutdown handling above all) can have before Win1/Win2 themselves exist.
 
