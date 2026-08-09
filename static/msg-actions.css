@@ -70,41 +70,57 @@
             mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='black' d='M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7a5 5 0 0 0 0 10h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1ZM8 13h8v-2H8v2Zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4a5 5 0 0 0 0-10Z'/%3E%3C/svg%3E");
 }
 
-/* ═══ 1 · TOUCH MODE: de-crowd the bubble ════════════════════════════════
-   body.cb-touch is set by the patch script from the LAST pointer type used
-   (not a one-shot media query) so hybrid laptop/tablet hardware behaves
-   correctly in both modes without a reload. */
+/* ═══ 1 · ZERO BUTTONS ON THE BUBBLE ═════════════════════════════════════
+   [v2] The whole .msg-actions cluster is GONE on every pointer type. No
+   copy, no edit, no delete floating over content — hovering a message is now
+   a pure CSS transformation and nothing else. Every one of those functions
+   lives in the long-press / right-click tray, which is also where copy now
+   handles images (sent AND received).
 
-/* Edit + delete leave the bubble on touch — they live in the tray now. */
-body.cb-touch .msg-actions .edit-btn,
-body.cb-touch .msg-actions .delete-btn { display: none; }
+   display:none rather than removing the node in JS: the markup keeps coming
+   from index.js's buildMessageActionsHTML, so leaving it in the DOM but
+   unrendered means zero risk to that contract, and index.js's delegated
+   .copy-btn / .edit-btn / .delete-btn click handlers simply never fire. */
+.msg-actions { display: none !important; }
 
-/* Copy stays exactly where it always was (explicit requirement) — but the
-   cluster is now hidden until THIS message is tapped. Overrides the old
-   `@media (hover:none){ .msg-actions{opacity:.55} }` by specificity. */
-body.cb-touch .msg-actions {
-    opacity: 0;
-    transform: translateY(-3px) scale(0.94);
-    transform-origin: top right;
-    pointer-events: none;
-    transition: opacity 130ms ease, transform 220ms var(--cb-spring);
+/* ── hover = transformation only ────────────────────────────────────────────
+   The bubble itself responds: a hair of lift, a lit top edge, and a faint
+   sheen that sweeps in from the reading direction. GPU-only properties
+   (transform / box-shadow / background-position), so no reflow and no
+   neighbour repaint. Desktop-only: (hover:hover) keeps phones out of it,
+   where a "hover" state would just be a stuck highlight after a tap. */
+@media (hover: hover) and (pointer: fine) {
+    .message > .bubble,
+    .message > .bubble-file,
+    .message > .bubble-audio,
+    .message > .bubble-sticker,
+    .message > .bubble-youtube {
+        transition: transform var(--cb-t-quick, 190ms) var(--cb-spring),
+                    box-shadow var(--cb-t-quick, 190ms) ease,
+                    border-color var(--cb-t-micro, 120ms) ease;
+    }
+    .message:hover > .bubble,
+    .message:hover > .bubble-file,
+    .message:hover > .bubble-audio,
+    .message:hover > .bubble-sticker,
+    .message:hover > .bubble-youtube {
+        transform: translateY(-1.5px);
+        border-color: rgba(255, 255, 255, 0.17);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09),
+                    0 8px 22px rgba(0, 0, 0, 0.5);
+    }
+    /* Right-click hint: the cursor tells you there's a menu here, so the
+       removed buttons don't leave the affordance undiscoverable. */
+    .message > .bubble,
+    .message > .bubble-file,
+    .message > .bubble-audio,
+    .message > .bubble-sticker,
+    .message > .bubble-youtube { cursor: context-menu; }
+    .message.message--deleted > .bubble { cursor: default; }
 }
-body.cb-touch .message.cb-peek .msg-actions {
-    opacity: 1;
-    transform: none;
-    pointer-events: auto;
-}
-/* Bigger tap target on touch — 13px icons in a 4px button is a miss-fest. */
-body.cb-touch .msg-actions button { padding: 7px; }
-body.cb-touch .msg-actions .icon  { width: 15px; height: 15px; }
 
-/* Nothing copyable (a bare file / sticker / bare media) → no copy button.
-   Fixes "copy on a file copies its FILENAME": there is no text to copy, so
-   the affordance itself is gone rather than lying about what it does. */
-.message[data-cb-copy="none"] .copy-btn { display: none; }
-/* …and on touch that empties the cluster completely, so drop the chrome. */
-body.cb-touch .message[data-cb-copy="none"] .msg-actions { display: none; }
-/* Desktop: JS removes a fully-empty cluster node outright (see refine()). */
+/* Touch gets the same language on press instead of hover — see .cb-pressing
+   in block 2, which now carries a lit edge as well as the squeeze. */
 
 /* ═══ 2 · PRESS / ANCHOR AFFORDANCE ══════════════════════════════════════
    Long-press feedback and "this is the message the tray belongs to".
@@ -114,16 +130,22 @@ body.cb-touch .message[data-cb-copy="none"] .msg-actions { display: none; }
 .message.cb-pressing > .bubble-audio,
 .message.cb-pressing > .bubble-sticker,
 .message.cb-pressing > .bubble-youtube {
-    transform: scale(0.978);
-    transition: transform 180ms var(--cb-spring);
+    /* Touch's answer to the desktop hover state: squeeze + the same lit top
+       edge, so both pointer types speak one visual language. */
+    transform: scale(0.976);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10),
+                0 6px 18px rgba(0, 0, 0, 0.45);
+    transition: transform 200ms var(--cb-spring), box-shadow 200ms ease;
 }
 .message.cb-anchored > .bubble,
 .message.cb-anchored > .bubble-file,
 .message.cb-anchored > .bubble-audio,
 .message.cb-anchored > .bubble-sticker,
 .message.cb-anchored > .bubble-youtube {
-    box-shadow: 0 0 0 1px var(--border-3), 0 10px 30px rgba(0, 0, 0, 0.55);
-    transition: box-shadow 160ms ease;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.22),
+                inset 0 1px 0 rgba(255, 255, 255, 0.10),
+                0 12px 34px rgba(0, 0, 0, 0.6);
+    transition: box-shadow 180ms ease;
 }
 
 /* Touch: kill the native long-press callout/selection so OUR gesture owns
@@ -149,10 +171,15 @@ body.cb-touch textarea { -webkit-user-select: text; user-select: text; }
     max-width: min(78vw, 268px);
     padding: 5px;
     margin: 0;
-    background: var(--cb-tray-bg);
-    border: 1px solid var(--cb-tray-edge);
-    border-radius: 13px;
-    box-shadow: var(--cb-tray-shadow), var(--cb-hairline);
+    /* [v2] Smoked glass, matching shell-refine.css — a pseudo-transparent
+       wash over blurred black instead of a flat graphite fill. */
+    background: var(--cb-glass, linear-gradient(180deg, rgba(255,255,255,0.055), rgba(255,255,255,0.008))),
+                var(--cb-smoke, rgba(10,10,10,0.72));
+    -webkit-backdrop-filter: var(--cb-blur, blur(20px) saturate(155%));
+            backdrop-filter: var(--cb-blur, blur(20px) saturate(155%));
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 15px;
+    box-shadow: var(--cb-cast, 0 18px 44px rgba(0,0,0,0.66)), var(--cb-lip, inset 0 1px 0 rgba(255,255,255,0.10));
     display: none;
     flex-direction: column;
     gap: 1px;
@@ -441,17 +468,29 @@ body.cb-select #cb-select-bar { transform: none; }
     outline-offset: 1px;
 }
 @media (prefers-reduced-motion: reduce) {
-    #cb-tray, #cb-select-bar, .cb-mi, .cb-check, .cb-check::after,
-    body.cb-touch .msg-actions {
+    #cb-tray, #cb-select-bar, .cb-mi, .cb-check, .cb-check::after {
         transition-duration: 1ms !important;
         animation: none !important;
         opacity: 1;
     }
     #cb-tray            { transform: none; }
     .cb-mi              { opacity: 1; transform: none; }
-    body.cb-touch .msg-actions          { opacity: 0; transform: none; }
-    body.cb-touch .message.cb-peek .msg-actions { opacity: 1; }
     #cb-select-bar      { transform: translateY(-101%); }
     body.cb-select #cb-select-bar { transform: none; }
     .message.cb-deleting { animation: none !important; opacity: 0.5; }
+    /* [v2] The hover/press transformation is the only message affordance now,
+       so it must degrade to an instant, non-moving state change. */
+    .message:hover > .bubble,
+    .message:hover > .bubble-file,
+    .message:hover > .bubble-audio,
+    .message:hover > .bubble-sticker,
+    .message:hover > .bubble-youtube,
+    .message.cb-pressing > .bubble,
+    .message.cb-pressing > .bubble-file,
+    .message.cb-pressing > .bubble-audio,
+    .message.cb-pressing > .bubble-sticker,
+    .message.cb-pressing > .bubble-youtube {
+        transform: none !important;
+        transition-duration: 1ms !important;
+    }
 }

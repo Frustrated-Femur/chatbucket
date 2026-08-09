@@ -43,7 +43,6 @@ window.__cbMsgActions = { version: 1 };
 const LONGPRESS_MS     = 420;   // hold before the tray opens
 const PRESS_HINT_MS    = 165;   // hold before the squeeze feedback appears
 const MOVE_TOLERANCE   = 10;    // px of finger travel that cancels a hold
-const PEEK_MS          = 2600;  // how long a tapped bubble shows its copy btn
 const CONFIRM_MS       = 3500;  // armed-delete window (matches index.js)
 const TRAY_GRACE_MS    = 320;   // ignore scroll-close right after opening
 const DEL_BATCH        = 8;     // bulk delete: frames per burst
@@ -250,7 +249,6 @@ function setTouchMode(on) {
         if (on) input.setAttribute("enterkeyhint", "enter");
         else    input.removeAttribute("enterkeyhint");
     }
-    if (!on) clearPeek();
 }
 try { coarse.addEventListener("change", e => setTouchMode(e.matches)); }
 catch (_) { try { coarse.addListener(e => setTouchMode(e.matches)); } catch (__) {} }
@@ -260,24 +258,13 @@ window.addEventListener("pointerdown", e => {
     else if (e.pointerType === "mouse") setTouchMode(false);
 }, { capture: true, passive: true });
 
-// ═══ PEEK (touch: reveal one bubble's copy button) ═══════════════════════════
-let _peekEl = null, _peekTimer = 0;
-function clearPeek() {
-    clearTimeout(_peekTimer);
-    if (_peekEl) _peekEl.classList.remove("cb-peek");
-    _peekEl = null;
-}
-function peek(msgEl) {
-    if (!msgEl) return;
-    if (_peekEl === msgEl) { clearPeek(); return; }   // second tap = hide again
-    clearPeek();
-    _peekEl = msgEl;
-    msgEl.classList.add("cb-peek");
-    _peekTimer = setTimeout(clearPeek, PEEK_MS);
-}
-// Anything that already does something on tap must not also trigger a peek.
-const INTERACTIVE = "a[href], button, audio, video, input, .msg-actions, .reply-quote," +
-                    " [data-viewer-src], .yt-bubble-thumb-wrap, .file-link";
+// ═══ PEEK — REMOVED IN v2 ════════════════════════════════════════════════════
+// There are no on-bubble buttons left to reveal, so "tap to peek the copy
+// button" has nothing to show. Tapping a message is once again ONLY the app's
+// own behaviour (open media, load the YT player, follow a link); every action
+// lives in the tray. Kept as a no-op because setTouchMode / the scroll handler
+// / applyDeleteToDOM all used to call it, and a stale reference would throw.
+function clearPeek() { /* v2: no-op — on-bubble action buttons are gone */ }
 
 // ═══ THE TRAY ═══════════════════════════════════════════════════════════════
 let tray = null;             // the single reused DOM node
@@ -324,8 +311,6 @@ function trayHTML(msgEl) {
     const own     = isOwn(msgEl);
     const dead    = isDeleted(msgEl);
     const author  = (msgEl.dataset.user || "").slice(0, 18);
-    const secure  = !!(window.isSecureContext && window.ClipboardItem && navigator.clipboard &&
-                       navigator.clipboard.write);
 
     let i = 0, out = "";
     out += `<div class="cb-tray-head"><span>MESSAGE</span><b>${escapeSafe(author)}</b></div>`;
@@ -336,8 +321,13 @@ function trayHTML(msgEl) {
         out += mi("copy", pay.kind === "link" ? "Copy link" : "Copy text",
                   pay.kind === "link" ? ico("link") : baseIco("copy"), { i: i++ });
     }
-    if (media && secure && media.kind === "image") {
-        out += mi("copyimg", "Copy image", baseIco("copy"), { i: i++ });
+    // [v2] Copy image is offered for EVERY image bubble — sent or received,
+    // sticker or upload. It used to be gated behind isSecureContext +
+    // ClipboardItem, which on this http:// tailnet deployment is ALWAYS false,
+    // so the item never actually appeared. copyImage() now has a legacy
+    // clipboard path that works without a secure context (see below).
+    if (media && (media.kind === "image")) {
+        out += mi("copyimg", media.sticker ? "Copy sticker" : "Copy image", baseIco("copy"), { i: i++ });
     }
     if (media) {
         const lbl = media.sticker ? "Save sticker"
@@ -570,18 +560,72 @@ function saveMedia(msgEl) {
     toast(sameOrigin ? "Saving " + (name || "file") + "…" : "Opened in a new tab — long-press to save.");
 }
 
+// Copy an image to the clipboard, on BOTH kinds of deployment.
+//
+// Path A (https / localhost): a real bitmap via ClipboardItem — pastes into
+//   Photoshop, Paint, Discord, anything.
+// Path B (this project's plain http:// tailnet): navigator.clipboard.write
+//   does not exist outside a secure context, so instead we hijack a synchronous
+//   `copy` event and write BOTH flavours by hand — text/html holding an <img>
+//   tag with an ABSOLUTE url, plus text/plain holding that url. Rich-text
+//   targets (ChatBucket's own composer, Gmail, Word, Obsidian) render the
+//   image; plain-text targets get a working link. clipboardData.setData has no
+//   secure-context requirement, which is exactly why it's the path that runs.
 async function copyImage(msgEl) {
     const t = mediaTarget(msgEl);
     if (!t || t.kind !== "image") return;
-    try {
-        const res  = await fetch(t.href, { credentials: "same-origin" });
-        const blob = await res.blob();
-        const type = blob.type && blob.type.startsWith("image/") ? blob.type : "image/png";
-        await navigator.clipboard.write([new ClipboardItem({ [type]: blob })]);
-        toast("Image copied.");
-    } catch (_) {
-        toast("Couldn't copy the image — use Save instead.");
+
+    let abs = t.href;
+    try { abs = new URL(t.href, location.href).href; } catch (_) {}
+
+    // ── Path A: true bitmap copy where the platform allows it ──────────────
+    if (window.isSecureContext && window.ClipboardItem &&
+        navigator.clipboard && navigator.clipboard.write) {
+        try {
+            const res  = await fetch(t.href, { credentials: "same-origin" });
+            const blob = await res.blob();
+            const type = blob.type && blob.type.startsWith("image/") ? blob.type : "image/png";
+            await navigator.clipboard.write([new ClipboardItem({ [type]: blob })]);
+            toast("Image copied.");
+            return;
+        } catch (_) { /* fall through to Path B */ }
     }
+
+    // ── Path B: legacy dual-flavour copy (works on http://) ────────────────
+    const onCopy = (e) => {
+        try {
+            e.clipboardData.setData("text/html",
+                '<img src="' + abs.replace(/"/g, "&quot;") + '">');
+            e.clipboardData.setData("text/plain", abs);
+            e.preventDefault();
+        } catch (_) {}
+    };
+    document.addEventListener("copy", onCopy, true);
+    let ok = false;
+    try {
+        // execCommand('copy') is a no-op without a selection, so give it one:
+        // an off-screen, selected node. Same offscreen-textarea trick index.js
+        // uses in legacyCopyToClipboard, minus the value round-trip.
+        const holder = document.createElement("div");
+        holder.contentEditable = "true";
+        holder.textContent = abs;
+        holder.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0;";
+        document.body.appendChild(holder);
+        const range = document.createRange();
+        range.selectNodeContents(holder);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        ok = document.execCommand("copy");
+        sel.removeAllRanges();
+        holder.remove();
+    } catch (_) { ok = false; }
+    document.removeEventListener("copy", onCopy, true);
+
+    // Honest wording: this is not a raw bitmap, and saying "copied" flatly
+    // would mislead anyone about to paste into an image editor.
+    toast(ok ? "Image copied — paste it anywhere on your network."
+             : "Couldn't copy the image — use Save instead.");
 }
 
 // ═══ GESTURES: right-click (desktop) · long-press (touch) ════════════════════
@@ -644,14 +688,10 @@ function onMsgPointerMove(e) {
 
 function onMsgPointerUp(e) {
     if (!press) return;
-    const { msgEl, fired, moved } = press;
     cancelPress();
-    if (fired || moved) return;
-    if (e.pointerType === "mouse") return;
-    // A plain tap on a non-interactive part of the bubble reveals that one
-    // message's copy button (requirement 4) — and nothing else.
-    if (e.target.closest(INTERACTIVE)) return;
-    peek(msgEl);
+    // [v2] Nothing else to do on a plain tap. The peek gesture is gone with
+    // the on-bubble buttons, so a short tap now falls through untouched to
+    // index.js's own handlers (media viewer, YouTube mount, links).
 }
 
 function onContextMenu(e) {

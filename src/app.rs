@@ -16,10 +16,10 @@
 use crate::arbitration::{PeerInfo, PeerList};
 use crate::host_state::HostState;
 use crate::manager::{
-    ActionResult, ClaimedReachability, ManagerContext, RoleDetail, RoleState, StatusSnapshot,
-    UpdateCheckResult, UpdateInstallResult,
+    ActionResult, ClaimedReachability, ConfigSaveResult, ManagerContext, RoleDetail, RoleState,
+    StatusSnapshot, UpdateCheckResult, UpdateInstallResult,
 };
-use crate::syncthing::SyncthingState;
+use crate::syncthing::{ManagerConfig, SyncthingState};
 use eframe::egui;
 use egui::{Color32, RichText};
 use std::sync::mpsc::{Receiver, Sender};
@@ -51,6 +51,8 @@ enum WorkerMsg {
     ActionDone(ActionKind, ActionResult),
     UpdateCheck(UpdateCheckResult),
     UpdateInstall(UpdateInstallResult),
+    ConfigSaved(ConfigSaveResult),
+    ConfigTested(SyncthingState),
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +68,8 @@ enum WorkerCmd {
     Stop,
     CheckUpdate,
     InstallUpdate,
+    SaveConfig(ManagerConfig),
+    TestSyncthing,
     Shutdown,
 }
 
@@ -83,6 +87,17 @@ pub struct ManagerApp {
 
     starting_since: Option<Instant>,
 
+    // Syncthing config editor state — loaded from disk on startup, mutated
+    // in-place as the user types; "Save" flushes back through the worker.
+    cfg_api_key: String,
+    cfg_url: String,
+    cfg_show_key: bool,
+    cfg_dirty: bool,
+    cfg_status_line: Option<String>,
+    cfg_parse_err: Option<String>,
+    /// (key, url) as last read/saved. Used for dirty detection and Reset.
+    cfg_disk_snapshot: (String, String),
+
     cmd_tx: Sender<WorkerCmd>,
     msg_rx: Receiver<WorkerMsg>,
 
@@ -97,11 +112,27 @@ struct Busy {
     check_update: bool,
     install_update: bool,
     refresh: bool,
+    save_config: bool,
+    test_syncthing: bool,
 }
 
 impl Busy {
     fn any(&self) -> bool {
-        self.start || self.stop || self.check_update || self.install_update || self.refresh
+        self.start
+            || self.stop
+            || self.check_update
+            || self.install_update
+            || self.refresh
+            || self.save_config
+            || self.test_syncthing
+    }
+    /// Only the actions that mutate lifecycle state (Start / Stop / Install).
+    /// Config edit, Test and Refresh don't need to block each other; blocking
+    /// them all together was overzealous — e.g. it prevented saving a fresh
+    /// key while a Refresh was in flight, which is exactly the moment the
+    /// user just fixed a 401.
+    fn any_lifecycle(&self) -> bool {
+        self.start || self.stop || self.install_update
     }
 }
 
@@ -129,6 +160,12 @@ impl ManagerApp {
         // Kick off first refresh immediately.
         let _ = cmd_tx.send(WorkerCmd::Refresh);
 
+        // Load the on-disk config into the input boxes so the user sees the
+        // current value (masked) instead of an empty prompt every open.
+        let (cfg, parse_err) = ctx.read_config();
+        let cfg_api_key = cfg.syncthing_api_key.clone().unwrap_or_default();
+        let cfg_url = cfg.syncthing_url.clone().unwrap_or_default();
+
         Self {
             ctx,
             snapshot: None,
@@ -139,6 +176,13 @@ impl ManagerApp {
             update_detail: None,
             can_install: false,
             starting_since: None,
+            cfg_api_key: cfg_api_key.clone(),
+            cfg_url: cfg_url.clone(),
+            cfg_show_key: false,
+            cfg_dirty: false,
+            cfg_status_line: None,
+            cfg_parse_err: parse_err,
+            cfg_disk_snapshot: (cfg_api_key, cfg_url),
             cmd_tx,
             msg_rx,
             egui_ctx: egui_ctx_slot,
@@ -226,6 +270,39 @@ impl ManagerApp {
                     let _ = self.cmd_tx.send(WorkerCmd::Refresh);
                     self.busy.refresh = true;
                 }
+                WorkerMsg::ConfigSaved(result) => {
+                    self.busy.save_config = false;
+                    self.cfg_status_line = Some(result.detail.clone());
+                    if let Some(saved) = result.saved.as_ref() {
+                        // Sync input boxes to what's actually on disk
+                        // (post-normalisation — whitespace/quote/slash
+                        // handling may have modified what the user typed).
+                        let k = saved.syncthing_api_key.clone().unwrap_or_default();
+                        let u = saved.syncthing_url.clone().unwrap_or_default();
+                        self.cfg_api_key = k.clone();
+                        self.cfg_url = u.clone();
+                        self.cfg_disk_snapshot = (k, u);
+                        self.cfg_dirty = false;
+                        self.cfg_parse_err = None;
+                    }
+                    if !result.ok {
+                        self.set_banner(BannerKind::Warn, &result.detail);
+                    }
+                    // Refresh so the Syncthing card re-renders from the new
+                    // cache state populated by save_config().
+                    let _ = self.cmd_tx.send(WorkerCmd::Refresh);
+                    self.busy.refresh = true;
+                }
+                WorkerMsg::ConfigTested(state) => {
+                    self.busy.test_syncthing = false;
+                    self.cfg_status_line = Some(format!(
+                        "Test result: {} — {}",
+                        state.short_label(),
+                        state.detail()
+                    ));
+                    let _ = self.cmd_tx.send(WorkerCmd::Refresh);
+                    self.busy.refresh = true;
+                }
             }
         }
     }
@@ -276,6 +353,7 @@ impl eframe::App for ManagerApp {
                         self.render_claimed_card(ui);
                         self.render_peers_card(ui);
                         self.render_syncthing_card(ui);
+                        self.render_syncthing_config_card(ui);
                         self.render_version_card(ui);
                         ui.add_space(8.0);
                         self.render_refresh_footer(ui);
@@ -480,14 +558,151 @@ impl ManagerApp {
                 status_row(ui, DotColor::Offline, "sync-state", "loading…");
                 return;
             };
-            let (dot, label) = match &snap.syncthing {
-                SyncthingState::NotConfigured => (DotColor::Offline, "not configured".to_string()),
-                SyncthingState::InSync => (DotColor::Online, "in sync".to_string()),
-                SyncthingState::Syncing => (DotColor::Warn, "syncing…".to_string()),
-                SyncthingState::Error(d) => (DotColor::Error, d.clone()),
+            let dot = match &snap.syncthing {
+                SyncthingState::InSync => DotColor::Online,
+                SyncthingState::Syncing => DotColor::Warn,
+                SyncthingState::NotConfigured => DotColor::Offline,
+                SyncthingState::AuthFailed
+                | SyncthingState::FolderMissing
+                | SyncthingState::BadConfig(_)
+                | SyncthingState::Error(_) => DotColor::Error,
+                SyncthingState::Unreachable(_) => DotColor::Warn,
             };
+            let label = snap.syncthing.short_label();
             status_row(ui, dot, "sync-state", &label);
+            // Detail line — the user needs to know WHY it's red before they
+            // can act. Previously (single "error" state) they'd have had to
+            // guess between "wrong key" and "syncthing down".
+            let detail = snap.syncthing.detail();
+            if !detail.is_empty()
+                && !matches!(&snap.syncthing, SyncthingState::InSync | SyncthingState::Syncing)
+            {
+                ui.add_space(4.0);
+                ui.label(RichText::new(detail).color(C_TEXT_3).size(11.5));
+            }
         });
+    }
+
+    fn render_syncthing_config_card(&mut self, ui: &mut egui::Ui) {
+        card(ui, "Syncthing config", |ui| {
+            if let Some(err) = self.cfg_parse_err.clone() {
+                ui.label(
+                    RichText::new(format!(
+                        "manager_config.json is malformed: {err}. Saving will overwrite it \
+                         with a clean copy."
+                    ))
+                    .color(C_DANGER)
+                    .size(11.5),
+                );
+                ui.add_space(4.0);
+            }
+
+            // API key row
+            ui.label(
+                RichText::new("API KEY")
+                    .color(C_TEXT_3)
+                    .size(10.5)
+                    .strong(),
+            );
+            ui.horizontal(|ui| {
+                let mut edit = egui::TextEdit::singleline(&mut self.cfg_api_key)
+                    .hint_text("paste key from Syncthing → Actions → Settings → GUI")
+                    .desired_width(f32::INFINITY);
+                if !self.cfg_show_key {
+                    edit = edit.password(true);
+                }
+                let response = ui.add(edit);
+                if response.changed() {
+                    self.cfg_dirty = self.detect_dirty();
+                }
+                let toggle_label = if self.cfg_show_key { "Hide" } else { "Show" };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(toggle_label).color(C_TEXT_2).size(11.5),
+                        )
+                        .fill(C_SURFACE_3)
+                        .stroke(egui::Stroke::new(1.0, C_BORDER_2))
+                        .rounding(egui::Rounding::same(8.0))
+                        .min_size(egui::vec2(56.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    self.cfg_show_key = !self.cfg_show_key;
+                }
+            });
+
+            // URL row
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("URL (optional, defaults to http://127.0.0.1:8384)")
+                    .color(C_TEXT_3)
+                    .size(10.5)
+                    .strong(),
+            );
+            let url_edit = egui::TextEdit::singleline(&mut self.cfg_url)
+                .hint_text("http://127.0.0.1:8384")
+                .desired_width(f32::INFINITY);
+            if ui.add(url_edit).changed() {
+                self.cfg_dirty = self.detect_dirty();
+            }
+
+            // Buttons
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let can_save = self.cfg_dirty && !self.busy.any_lifecycle() && !self.busy.save_config;
+                let can_test = !self.cfg_api_key.trim().is_empty()
+                    && !self.busy.test_syncthing
+                    && !self.busy.any_lifecycle();
+                let can_reset = self.cfg_dirty && !self.busy.save_config;
+
+                let save_label = if self.busy.save_config { "Saving…" } else { "Save" };
+                let test_label = if self.busy.test_syncthing {
+                    "Testing…"
+                } else {
+                    "Test connection"
+                };
+
+                if action_button(ui, save_label, can_save, false).clicked() {
+                    self.clear_banner();
+                    self.busy.save_config = true;
+                    let cfg = ManagerConfig {
+                        syncthing_api_key: if self.cfg_api_key.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.cfg_api_key.clone())
+                        },
+                        syncthing_url: if self.cfg_url.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.cfg_url.clone())
+                        },
+                    };
+                    let _ = self.cmd_tx.send(WorkerCmd::SaveConfig(cfg));
+                }
+                if action_button(ui, test_label, can_test, false).clicked() {
+                    self.clear_banner();
+                    self.busy.test_syncthing = true;
+                    let _ = self.cmd_tx.send(WorkerCmd::TestSyncthing);
+                }
+                if action_button(ui, "Reset", can_reset, false).clicked() {
+                    self.cfg_api_key = self.cfg_disk_snapshot.0.clone();
+                    self.cfg_url = self.cfg_disk_snapshot.1.clone();
+                    self.cfg_dirty = false;
+                    self.cfg_status_line = Some("Reverted to on-disk config.".into());
+                }
+            });
+
+            if let Some(line) = self.cfg_status_line.clone() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(line).color(C_TEXT_2).size(11.5));
+            }
+        });
+    }
+
+    fn detect_dirty(&self) -> bool {
+        let (dk, du) = &self.cfg_disk_snapshot;
+        self.cfg_api_key.trim() != dk.trim() || self.cfg_url.trim() != du.trim()
     }
 
     fn render_version_card(&mut self, ui: &mut egui::Ui) {
@@ -605,6 +820,14 @@ fn spawn_worker(
                         WorkerCmd::InstallUpdate => {
                             let r = ctx.install_update();
                             let _ = msg_tx.send(WorkerMsg::UpdateInstall(r));
+                        }
+                        WorkerCmd::SaveConfig(cfg) => {
+                            let r = ctx.save_config(cfg);
+                            let _ = msg_tx.send(WorkerMsg::ConfigSaved(r));
+                        }
+                        WorkerCmd::TestSyncthing => {
+                            let r = ctx.test_syncthing();
+                            let _ = msg_tx.send(WorkerMsg::ConfigTested(r));
                         }
                     }
                     // Wake GUI so it sees new messages promptly.
@@ -840,6 +1063,10 @@ pub fn cli_probe() -> anyhow::Result<()> {
         }
         SyncthingState::InSync => println!("  in_sync"),
         SyncthingState::Syncing => println!("  syncing"),
+        SyncthingState::AuthFailed => println!("  AUTH FAILED (Syncthing rejected the API key)"),
+        SyncthingState::Unreachable(d) => println!("  UNREACHABLE — {d}"),
+        SyncthingState::FolderMissing => println!("  FOLDER NOT FOUND ('sync-state' folder id"),
+        SyncthingState::BadConfig(d) => println!("  BAD CONFIG — {d}"),
         SyncthingState::Error(d) => println!("  ERROR — {d}"),
     }
     Ok(())

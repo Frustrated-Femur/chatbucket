@@ -13,7 +13,12 @@
          its rules win on ties without !important. Owns: the touch-only
          de-crowding of .msg-actions (copy stays, edit/delete move into the
          long-press tray), the tray itself, and selection mode. -->
-    <link rel="stylesheet" href="/static/msg-actions.css?v=1">
+    <link rel="stylesheet" href="/static/msg-actions.css?v=2">
+    <!-- [UX] Shell refinement. Loaded LAST so it owns the final say on the
+         header/presence rail, the compose dock and shared motion tokens.
+         Solves: presence pills wrapping into extra header rows, four compose
+         buttons crowding the input, and every remaining overflow case. -->
+    <link rel="stylesheet" href="/static/shell-refine.css?v=3">
     <link rel="icon" href="/static/icons/favicon.png">
     <!-- [PERF] Preconnect to origins we know we'll hit — parallel DNS/TLS
          warm-up so first real request lands instantly. Cheap, zero-risk. -->
@@ -269,7 +274,13 @@
      perf-overlay.js: it wraps buildMessageEl / copyMessageText /
      applyDeleteToDOM / setReply and keeps the originals as fallbacks, so a
      failure in here degrades to stock behaviour instead of breaking the app. -->
-<script src="/static/msg-actions.js?v=1" defer></script>
+<script src="/static/msg-actions.js?v=2" defer></script>
+<!-- [UX] Shell patch layer. MUST load after msg-actions.js. It MOVES the four
+     compose buttons into a dock (keeping their ids + inline onclick intact, so
+     every existing handler and Alt+key shortcut still works) and wraps
+     #presence-bar in a scrollable rail. Each block is independently
+     try/caught, so one failure can't take the shell down. -->
+<script src="/static/shell-refine.js?v=3" defer></script>
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79"}' crossorigin="anonymous"></script>
 <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79"}' crossorigin="anonymous"></script>

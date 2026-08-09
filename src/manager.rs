@@ -19,7 +19,7 @@ use crate::arbitration::{self, ArbitrationError, PeerList};
 use crate::host_state::{self, HostState, HostStateError};
 use crate::process_scan::{self, ChatBucketProc, ProcRole, SubShape};
 use crate::repo;
-use crate::syncthing::{self, SyncthingState};
+use crate::syncthing::{self, ManagerConfig, SyncthingState};
 use crate::update::{self, GithubRelease};
 
 use std::path::PathBuf;
@@ -149,6 +149,19 @@ pub struct ManagerContext {
     last_update_check: Mutex<Option<GithubRelease>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConfigSaveResult {
+    pub ok: bool,
+    pub detail: String,
+    /// The stored config AFTER normalisation, so the GUI can refresh its
+    /// input boxes with what actually landed on disk (whitespace stripped,
+    /// trailing slash removed, empty-string → unset).
+    pub saved: Option<ManagerConfig>,
+    /// A live test-connect result run against the just-saved config, so the
+    /// user gets one round-trip answer instead of "saved" → wait 30s → error.
+    pub tested: Option<SyncthingState>,
+}
+
 impl ManagerContext {
     pub fn new(repo_root: PathBuf) -> Self {
         let my_name = detect_machine_name();
@@ -218,6 +231,69 @@ impl ManagerContext {
             subshape: p.subshape,
         });
         derive_role_state(&hs, claimed.as_deref(), &self.my_name, proc.as_ref())
+    }
+
+    // ── Manager config (Syncthing API key + URL) ───────────────────
+
+    /// Read the current on-disk config. Returns `(config, parse_error)`.
+    /// A parse error means the file exists but is malformed — the GUI
+    /// should render that inline instead of silently blanking the boxes.
+    pub fn read_config(&self) -> (ManagerConfig, Option<String>) {
+        syncthing::read_config(&self.repo_root)
+    }
+
+    /// Save a new config atomically. The GUI passes what the user typed;
+    /// this method does the whitespace/quote normalisation on the way in,
+    /// invalidates the status cache, and (for user feedback) runs an
+    /// immediate test-connect against the just-saved config so the user
+    /// sees "OK / auth failed / unreachable" without waiting 30s.
+    pub fn save_config(&self, cfg: ManagerConfig) -> ConfigSaveResult {
+        match syncthing::save_config(&self.repo_root, cfg) {
+            Ok(saved) => {
+                // Only test if there IS actually a key to test against —
+                // saving an empty key intentionally clears the config,
+                // which should not surface as "unreachable".
+                let tested = if saved.key().is_some() {
+                    Some(syncthing::test_now(&self.repo_root))
+                } else {
+                    None
+                };
+                let detail = match &tested {
+                    None => "Config saved. Syncthing probe disabled (no API key).".to_string(),
+                    Some(SyncthingState::InSync) => "Saved. Connected — folder in sync.".into(),
+                    Some(SyncthingState::Syncing) => "Saved. Connected — folder syncing.".into(),
+                    Some(SyncthingState::AuthFailed) => {
+                        "Saved, but Syncthing rejected the key (401/403).".into()
+                    }
+                    Some(SyncthingState::Unreachable(d)) => {
+                        format!("Saved, but could not reach Syncthing: {d}")
+                    }
+                    Some(SyncthingState::FolderMissing) => format!(
+                        "Saved, but Syncthing has no folder id '{}'.",
+                        syncthing::FOLDER_ID
+                    ),
+                    Some(other) => format!("Saved. Status: {}", other.short_label()),
+                };
+                ConfigSaveResult {
+                    ok: true,
+                    detail,
+                    saved: Some(saved),
+                    tested,
+                }
+            }
+            Err(e) => ConfigSaveResult {
+                ok: false,
+                detail: format!("Could not save manager_config.json: {e}"),
+                saved: None,
+                tested: None,
+            },
+        }
+    }
+
+    /// Force a fresh Syncthing probe (skips the 30s cache). Used by the
+    /// "Test connection" button next to the API key input.
+    pub fn test_syncthing(&self) -> SyncthingState {
+        syncthing::test_now(&self.repo_root)
     }
 
     // ── start() ─────────────────────────────────────────────────────
