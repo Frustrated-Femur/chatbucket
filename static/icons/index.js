@@ -12,51 +12,6 @@
 const $  = (id) => document.getElementById(id);
 const $$ = (sel, root = document) => root.querySelector(sel);
 
-// [PERF] Central client message store + live DOM-node index.
-//   · `_msgStore`     — message id → message object. Sources converge here
-//                       (history pages AND WebSocket updates), so the DOM is a
-//                       rendering layer, not the database. Survives DOM
-//                       eviction when the window trims.
-//   · `_msgNodeIndex` — message id → currently-connected DOM element.
-//                       O(1) lookups replace a document-wide attribute
-//                       querySelector on every edit/delete/jump/de-dupe.
-// Both are additive; every path still falls back to querySelector if a node
-// is somehow missing, so this cannot regress correctness.
-const _msgStore     = new Map();
-const _msgNodeIndex = new Map();
-
-function findMsgEl(id) {
-    if (!id) return null;
-    const el = _msgNodeIndex.get(id);
-    if (el && el.isConnected) return el;
-    if (el) _msgNodeIndex.delete(id);   // stale (evicted/cleared) — drop it
-    return null;
-}
-
-// Store the canonical message object (and rebuild the node index). Idempotent.
-function _storeMessage(msg, el) {
-    if (!msg) return el;
-    const id = msg.id || (msg.timestamp && msg.user ? msg.timestamp + "_" + msg.user : null);
-    if (id) {
-        _msgStore.set(id, msg);
-        if (el && el.nodeType === 1) {
-            el.dataset.msgid = id;
-            _msgNodeIndex.set(id, el);
-        }
-    }
-    return el;
-}
-
-// Keep the store honest when an edit/delete broadcast changes a message that
-// is only present as a cached object (its DOM node may already be evicted).
-function _patchStoredMessage(id, patch) {
-    if (!id) return;
-    const msg = _msgStore.get(id);
-    if (msg) Object.assign(msg, patch);
-}
-
-window.__cbMsgIndex = { find: findMsgEl, store: _msgStore, nodes: _msgNodeIndex };
-
 // [SEC] All user-supplied strings that ever land in `innerHTML` must go through
 // this. Previously `msg.user`, `msg.text`, `msg.filename`, `msg.replyTo.*` were
 // interpolated raw into template strings — a straightforward XSS vector.
@@ -97,11 +52,8 @@ let newestTimestamp  = null;
 let isLoadingNewer   = false;
 let noMoreNewer      = true;   // true = DOM already reaches the live tail
 const PAGE_SIZE      = 50;
-// [PERF] DOM capping window. Raised 150 → 400: with per-message
-// content-visibility + containment + has-media size hints + lazy media,
-// ~400 retained nodes stay cheaper than 150 nodes churning in/out every
-// rapid scroll-back/forward. Tuned for smoothness, not minimal DOM count.
-const DOM_CAP        = 400;
+// [PERF] Reduced from 400 → 150. Fewer DOM nodes = less layout/paint cost.
+const DOM_CAP        = 150;
 // [FIX] Ceiling for the unread-boundary catch-up fetch in loadHistory() —
 // see fetchEnoughForBoundary(). Reuses DOM_CAP rather than a separate
 // magic number: DOM_CAP already IS this hardware's answer to "how much
@@ -2157,9 +2109,6 @@ function renderMessagesInto(frag, msgs, seedUser, seedDateKey = null) {
 async function loadHistory() {
     const messagesEl = $("messages");
     messagesEl.innerHTML = "";
-    // [PERF] The DOM was just torn down — the node index no longer points at
-    // anything real. Clear it so stale entries don't pile up across sessions.
-    _msgNodeIndex.clear();
     lastRenderedUser  = null;
     lastRenderedDateKey  = null;
     firstRenderedDateKey = null;
@@ -2493,7 +2442,6 @@ function trimDOMBottom(container) {
     const excess = msgs.length - DOM_CAP;
     for (let i = msgs.length - 1; i >= msgs.length - excess; i--) {
         AnimatedMedia.release(msgs[i]);
-        if (msgs[i].dataset && msgs[i].dataset.msgid) _msgNodeIndex.delete(msgs[i].dataset.msgid);
         msgs[i].remove();
     }
     lastRenderedUser = null;
@@ -2523,7 +2471,6 @@ function trimDOMTop(container) {
     const excess = msgs.length - DOM_CAP;
     for (let i = 0; i < excess; i++) {
         AnimatedMedia.release(msgs[i]);
-        if (msgs[i].dataset && msgs[i].dataset.msgid) _msgNodeIndex.delete(msgs[i].dataset.msgid);
         msgs[i].remove();
     }
     const remaining = container.querySelector(".message");
@@ -2706,21 +2653,6 @@ function connectWebSocket() {
         }
         if (msg.type === "edit_rejected") {
             showToast(msg.reason === "expired" ? "Edit window has expired." : "Couldn't save edit.");
-            return;
-        }
-        if (msg.type === "edit_result") {
-            if (!msg.ok) showToast("Couldn't save edit.");
-            return;
-        }
-        if (msg.type === "delete_result") {
-            if (!msg.ok) {
-                showToast(msg.reason === "not_owner" ? "You can only delete your own messages."
-                          : msg.reason === "not_found" ? "Message not found — it may already be gone."
-                          : "Couldn't delete the message.");
-                // The message wasn't actually deleted server-side: drop the
-                // tombstone styling so the UI doesn't lie about the state.
-                if (msg.id) undoDeleteOfDOM(msg.id);
-            }
             return;
         }
 
@@ -3177,7 +3109,7 @@ function clearReply() {
 }
 
 function scrollToMessage(id) {
-    const el = findMsgEl(id) || document.querySelector(`[data-msgid="${CSS.escape(id)}"]`);
+    const el = document.querySelector(`[data-msgid="${CSS.escape(id)}"]`);
     if (!el) return;
     el.scrollIntoView({ block: "center" });
     el.classList.add("highlight-flash");
@@ -3749,8 +3681,7 @@ function resetDeleteConfirm() {
 
 // ── applying broadcasts (own tab included — see WS handler) ─────────────
 function applyEditToDOM(id, value) {
-    _patchStoredMessage(id, { text: value });
-    const msgEl = findMsgEl(id) || document.querySelector(`[data-msgid="${CSS.escape(id)}"]`);
+    const msgEl = document.querySelector(`[data-msgid="${CSS.escape(id)}"]`);
     if (!msgEl) return; // scrolled out of the DOM_CAP window — fine, matches history's own risk tolerance
     const textEl = msgEl.querySelector(".bubble-text, .bubble-caption");
     if (!textEl) return;
@@ -3769,8 +3700,7 @@ function applyEditToDOM(id, value) {
 }
 
 function applyDeleteToDOM(id) {
-    _patchStoredMessage(id, { deleted: true });
-    const msgEl = findMsgEl(id) || document.querySelector(`[data-msgid="${CSS.escape(id)}"]`);
+    const msgEl = document.querySelector(`[data-msgid="${CSS.escape(id)}"]`);
     if (!msgEl) return;
     if (_activeEdit && _activeEdit.msgId === id) cancelInlineEdit();
     NowPlaying.stopIfMessage(id);
@@ -3780,23 +3710,6 @@ function applyDeleteToDOM(id) {
     if (bubble) {
         bubble.className = "bubble bubble-deleted";
         bubble.innerHTML = `<span class="bubble-text deleted-text">Message deleted</span>`;
-    }
-}
-
-// [FIX] Revert a message's *pending-delete* visual states when the server
-// reports a delete failed (delete_result ok:false). The DOM is NOT
-// optimistically tombstoned — tombstoning is applied only from the server's
-// own broadcast — so on failure we only need to clear the armed/pulsing
-// affordances. If a stray tombstone is somehow present, un-mark it so the
-// bubble doesn't lie when history reloads.
-function undoDeleteOfDOM(id) {
-    const msgEl = findMsgEl(id) || document.querySelector(`[data-msgid="${CSS.escape(id)}"]`);
-    if (msgEl) {
-        msgEl.classList.remove("cb-deleting", "confirm-armed");
-    }
-    if (_pendingDeleteConfirm && _pendingDeleteConfirm.btn &&
-        _pendingDeleteConfirm.btn.closest(`[data-msgid="${CSS.escape(id)}"]`)) {
-        resetDeleteConfirm();
     }
 }
 
@@ -3814,11 +3727,6 @@ function buildMessageEl(msg, prevUser) {
     const sameUser = prevUser === msg.user;
     if (msg.user === username) div.classList.add("own-message");
     if (sameUser)              div.classList.add("grouped");
-    // [PERF] Media-heavy bubbles get a taller intrinsic-size hint so
-    // content-visibility layout skipping reserves a closer-to-real size,
-    // reducing scrollbar jump when off-screen media nodes are (de)skipped.
-    if (msg.type === "file" || msg.type === "youtube" || msg.type === "ytdlp_audio" || msg.isSticker)
-        div.classList.add("has-media");
 
     const shortTime = msg.time ? msg.time.slice(0, 5) : "";
     const replyHTML = buildReplyQuoteHTML(msg.replyTo);
@@ -3857,8 +3765,6 @@ function buildMessageEl(msg, prevUser) {
     // this subtree. One entry point covers chat GIFs, sticker GIFs/WebPs,
     // and video stickers — both live messages and history-render paths use this.
     AnimatedMedia.scan(div);
-    // [PERF] Central store + O(1) node index (see definitions near DOM helpers).
-    _storeMessage(msg, div);
     return div;
 }
 
@@ -4071,8 +3977,7 @@ function buildFileBubbleHTML(msg, replyHTML, shortTime, div) {
 
 function appendMessage(msg) {
     // De-dupe by ID — server can legitimately replay a message on reconnect.
-    // O(1) index first; falls back to the former document-wide query.
-    if (msg.id && (findMsgEl(msg.id) || document.querySelector(`[data-msgid="${CSS.escape(msg.id)}"]`))) return;
+    if (msg.id && document.querySelector(`[data-msgid="${CSS.escape(msg.id)}"]`)) return;
 
     const messagesEl = $("messages");
     // [FIX] Snapshot the at-bottom state BEFORE we touch the DOM, and
@@ -4136,12 +4041,7 @@ function appendMessage(msg) {
     if (!isSystem && el && el.classList) {
         const enterClass = isOwn ? "msg-enter-own" : "msg-enter";
         el.classList.add(enterClass);
-        // [PERF] animationend BUBBLES — a child's animation finishing would
-        // otherwise strip the class early. Gate on e.target === el so only
-        // the bubble's own entry animation ends it (and once:true still
-        // self-cleans after the real event).
-        el.addEventListener("animationend", (e) => {
-            if (e.target !== el) return;
+        el.addEventListener("animationend", () => {
             el.classList.remove(enterClass);
         }, { once: true });
     }
@@ -4240,10 +4140,8 @@ function openGifDrawer() {
     // removed on animationend so it doesn't play on every subsequent tab
     // switch inside an already-open drawer.
     panel.classList.add("drawer-opening");
-    panel.addEventListener("animationend", (e) => {
-        // [PERF] animationend bubbles from children; only the drawer's own
-        // animation should clear its class.
-        if (e.target === panel) panel.classList.remove("drawer-opening");
+    panel.addEventListener("animationend", () => {
+        panel.classList.remove("drawer-opening");
     }, { once: true });
 
     if (currentGifTab === "local") loadLocalGifs();
@@ -4281,14 +4179,6 @@ function closeGifDrawer() {
 }
 
 function switchGifTab(tabName) {
-    // [REFACTOR] Active/inactive state is now driven by the .is-active class
-    // on .cb-panel-tab, so the tab visual language lives in index.css and
-    // stays consistent with .cb-panel-tab:hover, :focus-visible, :active,
-    // and the reduced-motion override. Previously this function blasted a
-    // long ad-hoc inline style-string onto style.cssText, which meant every
-    // future :hover / :focus rule was silently overridden by inline
-    // specificity, and the palette drifted from the design tokens
-    // (#2d2d2d/#444/#888 instead of --surface-4/--border-1/--text-3).
     currentGifTab = tabName;
     const localView       = $("engine-local-view");
     const giphyView       = $("engine-giphy-view");
@@ -4296,16 +4186,24 @@ function switchGifTab(tabName) {
     const giphyBtn        = $("tab-giphy-btn");
     const manualUploadBtn = $("gif-manual-upload-btn");
 
-    const showLocal = tabName === "local";
-    localView.style.display = showLocal ? "flex" : "none";
-    giphyView.style.display = showLocal ? "none" : "flex";
-    if (manualUploadBtn) manualUploadBtn.style.display = showLocal ? "flex" : "none";
+    const activeStyle   = "background:#2d2d2d;color:#fff;border:1px solid #444;padding:5px 14px;cursor:pointer;border-radius:4px;font-weight:500;";
+    const inactiveStyle = "background:transparent;color:#888;border:1px solid transparent;padding:5px 14px;cursor:pointer;border-radius:4px;font-weight:500;";
 
-    localBtn?.classList.toggle("is-active", showLocal);
-    giphyBtn?.classList.toggle("is-active", !showLocal);
-
-    if (showLocal) loadLocalGifs();
-    else $("giphy-search-input")?.focus();
+    if (tabName === "local") {
+        localView.style.display = "flex";
+        giphyView.style.display = "none";
+        if (manualUploadBtn) manualUploadBtn.style.display = "flex";
+        localBtn.style.cssText = activeStyle;
+        giphyBtn.style.cssText = inactiveStyle;
+        loadLocalGifs();
+    } else {
+        localView.style.display = "none";
+        giphyView.style.display = "flex";
+        if (manualUploadBtn) manualUploadBtn.style.display = "none";
+        giphyBtn.style.cssText = activeStyle;
+        localBtn.style.cssText = inactiveStyle;
+        $("giphy-search-input")?.focus();
+    }
 }
 
 async function loadLocalGifs() {
@@ -4559,8 +4457,8 @@ function toggleStickerDrawer() {
         });
         // [REDESIGN] Drawer expand animation — see openGifDrawer.
         panel.classList.add("drawer-opening");
-        panel.addEventListener("animationend", (e) => {
-            if (e.target === panel) panel.classList.remove("drawer-opening");
+        panel.addEventListener("animationend", () => {
+            panel.classList.remove("drawer-opening");
         }, { once: true });
 
         loadLocalStickers();
@@ -4796,8 +4694,8 @@ function openMusicDrawer() {
     });
     // [REDESIGN] Drawer expand animation — see openGifDrawer.
     panel.classList.add("drawer-opening");
-    panel.addEventListener("animationend", (e) => {
-        if (e.target === panel) panel.classList.remove("drawer-opening");
+    panel.addEventListener("animationend", () => {
+        panel.classList.remove("drawer-opening");
     }, { once: true });
 
     if (currentMusicTab === "local") loadLocalMusic();
@@ -4846,12 +4744,10 @@ function closeMusicDrawer() {
 }
 
 function switchMusicTab(tabName) {
-    // [REFACTOR] Same class-driven refactor as switchGifTab — see the note
-    // there for why. Leaving "local" (or arriving from it) shouldn't leave a
-    // preview playing invisibly behind whichever tab is now showing.
     currentMusicTab = tabName;
+    // Leaving local (or arriving from it) shouldn't leave a preview
+    // playing invisibly behind whichever tab is now showing.
     stopAudioPreview();
-
     const localView   = $("music-engine-local-view");
     const youtubeView = $("music-engine-youtube-view");
     const ytdlpView   = $("music-engine-ytdlp-view");
@@ -4860,13 +4756,16 @@ function switchMusicTab(tabName) {
     const ytdlpBtn    = $("music-tab-ytdlp-btn");
     const manualUploadBtn = $("music-manual-upload-btn");
 
+    const activeStyle   = "background:#2d2d2d;color:#fff;border:1px solid #444;padding:5px 14px;cursor:pointer;border-radius:4px;font-weight:500;";
+    const inactiveStyle = "background:transparent;color:#888;border:1px solid transparent;padding:5px 14px;cursor:pointer;border-radius:4px;font-weight:500;";
+
     localView.style.display   = tabName === "local"   ? "flex" : "none";
     youtubeView.style.display = tabName === "youtube" ? "flex" : "none";
     ytdlpView.style.display   = tabName === "ytdlp"   ? "flex" : "none";
 
-    localBtn?.classList.toggle("is-active",   tabName === "local");
-    youtubeBtn?.classList.toggle("is-active", tabName === "youtube");
-    ytdlpBtn?.classList.toggle("is-active",   tabName === "ytdlp");
+    localBtn.style.cssText   = tabName === "local"   ? activeStyle : inactiveStyle;
+    youtubeBtn.style.cssText = tabName === "youtube" ? activeStyle : inactiveStyle;
+    ytdlpBtn.style.cssText   = tabName === "ytdlp"   ? activeStyle : inactiveStyle;
 
     if (manualUploadBtn) manualUploadBtn.style.display = tabName === "local" ? "flex" : "none";
 

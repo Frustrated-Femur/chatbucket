@@ -23,3 +23,11 @@ venv/
 
 presence/
 sfx/
+
+manager_config.json
+
+cbm
+
+rust/target/
+
+

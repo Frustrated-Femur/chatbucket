@@ -10,7 +10,7 @@
     <!-- [PERF] Overlay stylesheet. Loaded AFTER index.css so its rules win the
          cascade without needing !important spam. GPU compositing, spring
          easings, content-visibility on off-screen bubbles. -->
-    <link rel="stylesheet" href="/static/perf-overlay.css?v=3">
+    <link rel="stylesheet" href="/static/perf-overlay.css?v=2">
 
     <!-- [UX] Message-actions overlay. Owns the long-press instrument tray and
          selection mode. Non-intrusive: nothing here changes document flow. -->
@@ -269,21 +269,21 @@
     <video id="viewer-video" controls style="display:none;"></video>
 </div>
 
-<script src="/static/index.js?v=2026082301"></script>
+<script src="/static/index.js?v=1755302400"></script>
 <!-- [PERF] Overlay script — loaded AFTER index.js so it can monkey-patch
      hot-path functions with cached / batched / GPU-friendly versions.
      Each patch keeps the original as a fallback. -->
-<script src="/static/perf-overlay.js?v=2" defer></script>
+<script src="/static/perf-overlay.js?v=1" defer></script>
 <!-- [UX] Message-actions patch layer — wraps buildMessageEl / copyMessageText /
      applyDeleteToDOM / setReply. Failures degrade to stock behaviour. -->
-<script src="/static/msg-actions.js?v=3" defer></script>
+<script src="/static/msg-actions.js?v=2" defer></script>
 <!-- [UX] Shell patch layer — moves the compose buttons into a dock when the
      compose bar can't fit them, wraps #presence-bar in a scrollable rail. -->
 <script src="/static/shell-refine.js?v=3" defer></script>
 <!-- [FIX] Failure-mode fixes — MUST load last. Wraps saveInlineEdit /
      cancelInlineEdit / applyEditToDOM etc. and installs the OS-aware
      clipboard path. Each wrapper try/catches back to the original. -->
-<script src="/static/fix-refine.js?v=2" defer></script>
+<script src="/static/fix-refine.js?v=1" defer></script>
 
 <!-- Single Cloudflare beacon. Duplicate module beacons from the original
      have been removed — they shipped identical hashes and did nothing extra. -->

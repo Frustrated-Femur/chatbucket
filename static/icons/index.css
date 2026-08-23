@@ -59,28 +59,6 @@
        "readout" feel instead of the rest of the UI's proportional type. */
     --font-mono:     ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono",
                       Menlo, Consolas, "Liberation Mono", monospace;
-
-    /* ── shell / tray shared tokens ─────────────────────────────────────
-       Previously redeclared in msg-actions.css and shell-refine.css. Now
-       defined ONCE, in the file that owns the token system. The overlay
-       layers still reference them via `var()` — nothing changes for them,
-       and if any layer ever loads out of order the tokens are still here. */
-    --cb-spring:       cubic-bezier(0.16, 1, 0.30, 1);
-    --cb-snap:         cubic-bezier(0.34, 1.4, 0.64, 1);
-    --cb-exit:         cubic-bezier(0.4, 0, 1, 1);
-    --cb-t-micro:      120ms;
-    --cb-t-quick:      190ms;
-    --cb-t-panel:      280ms;
-
-    /* Pseudo-glass reserved strictly for FLOATING surfaces (tray, dock,
-       toasts). Never applied to persistent chrome. */
-    --cb-glass:        linear-gradient(180deg, rgba(255,255,255,0.055) 0%,
-                                               rgba(255,255,255,0.022) 42%,
-                                               rgba(255,255,255,0.008) 100%);
-    --cb-smoke:        rgba(10, 10, 10, 0.72);
-    --cb-lip:          inset 0 1px 0 rgba(255,255,255,0.10);
-    --cb-cast:         0 18px 44px rgba(0,0,0,0.66), 0 2px 10px rgba(0,0,0,0.5);
-    --cb-blur:         blur(20px) saturate(155%);
 }
 
 /* ── reset ─────────────────────────────────────────────────────────────── */
@@ -267,9 +245,24 @@ h1 { margin-top: 0; letter-spacing: -0.02em; }
     will-change: auto;
     scroll-behavior: auto;
 }
-/* Mobile audio tweaks live with the other mobile rules at the bottom of
-   this file — one @media block per breakpoint, so nothing about the
-   compose row is silently overridden hundreds of lines apart. */
+/* ── mobile tweaks ─────────────────────────────────────────────────────── */
+@media (max-width: 640px) {
+    .bubble-audio {
+        max-width: 96%;
+    }
+
+    .chat-audio,
+    .yt-inline-audio-preview .chat-audio {
+        width: 100%;
+        min-width: 0;
+        max-width: none;
+        height: 48px;
+    }
+
+    .audio-name {
+        max-width: 220px;
+    }
+}
 
 /* ── bottom zone ───────────────────────────────────────────────────────── */
 #bottom-zone {
@@ -556,11 +549,29 @@ body.attachment-dragging {
 #attach-btn:hover #add,
 #attach-btn:focus-visible #add { filter: brightness(0) invert(1); }
 
-/* GIF / music toggles now use .icon.gif / .icon.music (see ".icon.gif" in
-   the icon system block above). The old text-chip fallbacks lived here
-   because the SVGs weren't guaranteed; keeping them as a defensive
-   fallback only — invisible if the mask resolves, chip-shaped if it
-   doesn't (::before draws it, but stays hidden while .icon paints). */
+/* GIF text-in-button retains a subtle chip look */
+#gif-written-in-button {
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    padding: 3px 8px;
+    border: 1px solid var(--border-2);
+    border-radius: var(--radius-xs);
+    color: inherit;
+}
+
+/* Music chip — same treatment as the GIF chip, note-glyph instead of text
+   since there's no dedicated music SVG in the icon set and adding one
+   would mean a new asset file this environment can't ship. */
+#music-written-in-button {
+    font-weight: 700;
+    font-size: 14px;
+    padding: 3px 9px;
+    border: 1px solid var(--border-2);
+    border-radius: var(--radius-xs);
+    color: inherit;
+    line-height: 1;
+}
 
 /* Send button — solid, primary action */
 #send-btn {
@@ -703,12 +714,11 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     50%      { box-shadow: 0 0 0 4px rgba(255,107,107,0); }
 }
 
-/* msg-actions.css universally hides .msg-actions on ALL pointer types (the
-   in-bubble cluster was replaced by the long-press instrument tray).
-   The touch fallback that used to live here was never reachable — cluster
-   is display:none globally. Kept the definitions above only because the
-   JS still builds the markup (buildMessageActionsHTML) and the delegated
-   click handlers still fire; the visuals are simply never rendered. */
+/* Touch devices never get :hover — same permanently-dim treatment the
+   old .copy-btn already used there, just applied to the whole cluster. */
+@media (hover: none) {
+    .msg-actions { opacity: 0.55; }
+}
 
 /* "(edited)" marker — a flag, not a version log; no prior text is kept. */
 .edited-badge {
@@ -772,23 +782,15 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
 
 .chat-image {
     display: block;
-    /* Cap both dimensions and preserve the source aspect ratio.
-       Previously `object-fit: cover` cropped portraits to square-ish; the
-       user was seeing screenshots and photos with their tops/bottoms
-       shaved. `contain` respects the intrinsic ratio, and the max-width/
-       max-height cap keeps the bubble bounded. Portrait images therefore
-       come out as tall thumbnails, landscape as wide, both un-cropped. */
     max-width: 320px;
     max-height: 340px;
-    width: auto;
-    height: auto;
     border-radius: var(--radius-sm);
     cursor: pointer;
     decoding: async;
     min-width: 60px;
     min-height: 60px;
     background: #151515;
-    object-fit: contain;
+    object-fit: cover;
     content-visibility: auto;
     transition: transform var(--dur-fast) ease, filter var(--dur-fast) ease;
 }
@@ -850,13 +852,7 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     min-width: 360px;
     max-width: 360px;
     height: 44px;
-    /* colorScheme=dark on <html> already gives the native <audio> element
-       a dark-mode set of controls in every modern browser. The old
-       `filter: invert() hue-rotate()` hack painted the whole player as an
-       inverted image — every future control tweak Chrome/Safari made
-       would land inverted too, and it never quite matched --surface-2.
-       `color-scheme: dark` is the intended API for this. */
-    color-scheme: dark;
+    filter: invert(0.9) hue-rotate(180deg);
 }
 
 .yt-inline-audio-preview .chat-audio {
@@ -940,10 +936,8 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
 .date-separator::after  { margin-left:  14px; }
 
 /* ── media viewer ──────────────────────────────────────────────────────── */
-/* #image-viewer no longer exists in the DOM — the previous selector was a
-   dead-code orphan from an earlier iteration. Only #media-viewer is
-   styled now. */
-#media-viewer {
+#media-viewer,
+#image-viewer {
     position: fixed;
     inset: 0;
     width: 100vw; height: 100vh;
@@ -1047,9 +1041,6 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
 }
 
 /* ── drag-and-drop overlay ─────────────────────────────────────────────── */
-/* Drag-and-drop is a desktop-only affordance. Touch pointers never see
-   the overlay or the per-panel dropzones (Section 26 of the design brief).
-   Attach on touch is the '+ Add Sticker / GIF / Music File' button. */
 #drop-overlay {
     display: none;
     position: fixed;
@@ -1071,19 +1062,7 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
 }
 #drop-overlay .icon.attach { width: 44px; height: 44px; color: var(--text); }
 
-/* Suppress D&D affordances on touch. The dropzones live inside each
-   panel and their own display would otherwise leave a large empty band
-   above the grid on phones. */
-@media (hover: none), (pointer: coarse) {
-    #drop-overlay,
-    #gif-dropzone, #sticker-dropzone, #music-dropzone,
-    .cb-panel-dropzone { display: none !important; }
-}
-
 /* ── mobile tweaks ─────────────────────────────────────────────────────── */
-/* One @media block per breakpoint. Merged the mobile audio rules that
-   previously lived hundreds of lines above (right after #messages), so
-   every mobile-only override is now in one place. */
 @media (max-width: 640px) {
     #chat-screen  { width: 100vw; }
     #header       { padding: 12px 14px; }
@@ -1091,18 +1070,9 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     #bottom-zone  { padding: 6px 10px 10px; }
     .bubble       { max-width: 90%; }
     .bubble-file  { max-width: 90%; }
-    .bubble-audio { max-width: 96%; }
+    .bubble-audio { max-width: 90%; }
     .chat-image   { max-width: 240px; }
-    .audio-name   { max-width: 220px; }
-
-.chat-audio,
-.yt-inline-audio-preview .chat-audio {
-    width: 360px;
-    min-width: 360px;
-    max-width: 360px;
-    height: 44px;
-    box-sizing: border-box;
-}
+    .audio-name   { max-width: 190px; }
 }
 
 /* ── upload progress ───────────────────────────────────────────────────── */
@@ -1120,230 +1090,26 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
 #upload-progress::-webkit-progress-value { background: var(--text-2); border-radius: var(--radius-pill); transition: width 120ms ease; }
 #upload-progress::-moz-progress-bar      { background: var(--text-2); border-radius: var(--radius-pill); }
 
-/* ═════════════════════════════════════════════════════════════════════════
-   Sticker / GIF / Music drawer  (.cb-panel* family)
-   ─────────────────────────────────────────────────────────────────────────
-   The three drawers share a body layout: a header row on top (title or
-   tabs on the left, upload + close on the right), then a two-pane body
-   below (folder sidebar + content pane), or a single-column layout for
-   the search tabs. Everything below is now class-driven — the panels no
-   longer carry inline styles in index.html, and the `!important` sprawl
-   this file used to need in order to overpower those inline styles is
-   gone with it.
-   ═════════════════════════════════════════════════════════════════════════ */
-
-.cb-panel {
-    display: flex;
-    flex-direction: column;
-    position: relative;
-    background: var(--surface-1);
-    border: 1px solid var(--border-1);
-    border-bottom: none;
+/* ── GIF/sticker/music drawer surface polish ───────────────────────────── */
+#gif-manager-panel,
+#sticker-manager-panel,
+#music-manager-panel {
+    background: var(--surface-1) !important;
+    border-top: 1px solid var(--border-1) !important;
+    padding: 14px !important;
+    height: 340px !important;
     border-radius: var(--radius-md) var(--radius-md) 0 0;
-    padding: 14px;
-    height: 340px;
     margin-bottom: 8px;
-    gap: 12px;
-    min-height: 0;
+}
+#gif-manager-panel > div:first-child,
+#sticker-manager-panel > div:first-child,
+#music-manager-panel > div:first-child {
+    border-bottom: 1px solid var(--border-1) !important;
+    padding-bottom: 10px !important;
+    margin-bottom: 12px !important;
 }
 
-.cb-panel-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 10px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid var(--border-1);
-    flex-shrink: 0;
-}
-
-.cb-panel-title {
-    font-weight: 600;
-    color: var(--text);
-    font-size: 14px;
-    letter-spacing: -0.01em;
-}
-
-.cb-panel-header-actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-}
-
-/* ── panel tabs ─────────────────────────────────────────────────────────
-   State is now a class (.is-active) instead of inline styles, so a
-   keyboard user hitting the tab twice, or a JS bug that fails to reset
-   the previous tab, can't leave two tabs looking active at once. */
-.cb-panel-tabs {
-    display: flex;
-    gap: 6px;
-}
-
-.cb-panel-tab {
-    padding: 6px 14px;
-    border-radius: var(--radius-sm);
-    font-size: 13px;
-    font-weight: 600;
-    background: transparent;
-    color: var(--text-3);
-    border: 1px solid transparent;
-    cursor: pointer;
-    font-family: inherit;
-    transition: background var(--dur-fast) ease,
-                color var(--dur-fast) ease,
-                border-color var(--dur-fast) ease;
-}
-.cb-panel-tab:hover { color: var(--text-2); background: var(--surface-2); }
-.cb-panel-tab.is-active {
-    background: var(--surface-4);
-    color: var(--text);
-    border-color: var(--border-1);
-}
-
-/* ── panel body layouts ────────────────────────────────────────────── */
-.cb-panel-body {
-    display: flex;
-    gap: 12px;
-    flex: 1;
-    overflow: hidden;
-    min-height: 0;
-}
-.cb-panel-body--column {
-    flex-direction: column;
-    gap: 10px;
-}
-
-.cb-panel-folders {
-    width: 170px;
-    overflow-y: auto;
-    padding-right: 6px;
-    border-right: 1px solid var(--border-1);
-    flex-shrink: 0;
-}
-
-.cb-panel-content {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    min-width: 0;
-}
-
-.cb-panel-newfolder {
-    width: 100%;
-    padding: 7px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-2);
-    border-radius: var(--radius-sm);
-    color: var(--text-2);
-    font-size: 12px;
-    font-weight: 600;
-    margin-bottom: 8px;
-    cursor: pointer;
-    font-family: inherit;
-    transition: background var(--dur-fast) ease,
-                color var(--dur-fast) ease,
-                border-color var(--dur-fast) ease;
-}
-.cb-panel-newfolder:hover {
-    background: var(--surface-3);
-    border-color: var(--border-3);
-    color: var(--text);
-}
-
-/* ── panel dropzone (desktop only — hidden on touch by the D&D block) ── */
-.cb-panel-dropzone {
-    text-align: center;
-    margin-bottom: 10px;
-    padding: 12px;
-    font-size: 12px;
-    color: var(--text-3);
-    background: var(--surface-2);
-    border: 2px dashed var(--border-2);
-    border-radius: var(--radius-sm);
-    transition: border-color var(--dur-fast) ease, background var(--dur-fast) ease;
-}
-.cb-panel-dropzone.is-active {
-    border-color: var(--border-3);
-    background: var(--surface-3);
-    color: var(--text-2);
-}
-
-/* ── panel grids (image thumbs) & list (audio rows) ────────────────── */
-.cb-panel-grid {
-    display: grid;
-    gap: 10px;
-    overflow-y: auto;
-    flex: 1;
-    padding-right: 2px;
-    align-content: start;
-    min-height: 0;
-}
-.cb-panel-grid--sticker { grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); }
-.cb-panel-grid--gif     { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
-.cb-panel-grid--music,
-.cb-panel-list {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    overflow-y: auto;
-    flex: 1;
-    padding-right: 2px;
-    min-height: 0;
-}
-
-/* ── panel search rows (Giphy / YouTube / yt-dlp) ──────────────────── */
-.cb-panel-searchrow {
-    display: flex;
-    gap: 8px;
-    flex-shrink: 0;
-}
-
-.cb-panel-search {
-    flex: 1;
-    padding: 8px 12px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-2);
-    border-radius: var(--radius-sm);
-    color: var(--text);
-    font-size: 13px;
-    font-family: inherit;
-    outline: none;
-    transition: border-color var(--dur-fast) ease, background var(--dur-fast) ease;
-}
-.cb-panel-search:focus { border-color: var(--border-3); background: var(--surface-3); }
-.cb-panel-search::placeholder { color: var(--text-4); }
-
-.cb-panel-searchbtn {
-    padding: 7px 16px;
-    background: var(--surface-4);
-    border: 1px solid var(--border-2);
-    color: var(--text);
-    border-radius: var(--radius-sm);
-    font-size: 13px;
-    font-weight: 600;
-    font-family: inherit;
-    cursor: pointer;
-    transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease;
-}
-.cb-panel-searchbtn:hover { background: #2e2e2e; border-color: var(--border-3); }
-
-/* ── panel upload buttons (+ Add Sticker / GIF / Music File) ──────── */
-.cb-panel-upload {
-    background: var(--surface-4);
-    color: var(--text);
-    border: 1px solid var(--border-2);
-    padding: 6px 14px;
-    border-radius: var(--radius-sm);
-    font-size: 12px;
-    font-weight: 600;
-    font-family: inherit;
-    cursor: pointer;
-    transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease;
-}
-.cb-panel-upload:hover { background: #2e2e2e; border-color: var(--border-3); }
-
-/* Panel close (× glyph) — used in every panel header. */
+/* Panel headers with icon-driven close */
 .panel-close-btn {
     background: transparent;
     border: none;
@@ -1357,6 +1123,88 @@ button { padding: 6px 16px; font-size: 15px; cursor: pointer; font-family: inher
     transition: background var(--dur-fast) ease, color var(--dur-fast) ease;
 }
 .panel-close-btn:hover { background: var(--surface-3); color: var(--text); }
+
+/* Tabs in the GIF / music panels */
+#gif-tabs button,
+#music-tabs button {
+    padding: 6px 14px !important;
+    border-radius: var(--radius-sm) !important;
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    transition: background var(--dur-fast) ease, color var(--dur-fast) ease, border-color var(--dur-fast) ease !important;
+}
+
+/* Green add-buttons in panels — recolored to neutral */
+#sticker-manual-upload-btn,
+#gif-manual-upload-btn,
+#music-manual-upload-btn {
+    background: var(--surface-4) !important;
+    color: var(--text) !important;
+    border: 1px solid var(--border-2) !important;
+    padding: 6px 14px !important;
+    border-radius: var(--radius-sm) !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease;
+}
+#sticker-manual-upload-btn:hover,
+#gif-manual-upload-btn:hover,
+#music-manual-upload-btn:hover {
+    background: #2e2e2e !important;
+    border-color: var(--border-3) !important;
+}
+
+/* New folder buttons */
+#btn-new-folder,
+#btn-new-sticker-folder,
+#btn-new-music-folder {
+    background: var(--surface-2) !important;
+    border: 1px solid var(--border-2) !important;
+    color: var(--text-2) !important;
+    border-radius: var(--radius-sm) !important;
+    transition: background var(--dur-fast) ease, color var(--dur-fast) ease, border-color var(--dur-fast) ease;
+}
+#btn-new-folder:hover,
+#btn-new-sticker-folder:hover,
+#btn-new-music-folder:hover {
+    background: var(--surface-3) !important;
+    border-color: var(--border-3) !important;
+    color: var(--text) !important;
+}
+
+/* Dropzones — softer, cleaner border */
+#gif-dropzone,
+#sticker-dropzone,
+#music-dropzone {
+    background: var(--surface-2) !important;
+    border: 2px dashed var(--border-2) !important;
+    color: var(--text-3) !important;
+    border-radius: var(--radius-sm) !important;
+    padding: 12px !important;
+    transition: border-color var(--dur-fast) ease, background var(--dur-fast) ease;
+}
+
+/* Giphy / YouTube / yt-dlp search inputs */
+#giphy-search-input,
+#youtube-search-input,
+#ytdlp-search-input {
+    background: var(--surface-2) !important;
+    border: 1px solid var(--border-2) !important;
+    color: var(--text) !important;
+    padding: 8px 12px !important;
+    border-radius: var(--radius-sm) !important;
+    font-family: inherit;
+}
+#giphy-search-input:focus,
+#youtube-search-input:focus,
+#ytdlp-search-input:focus { outline: none; border-color: var(--border-3) !important; }
+
+/* Sidebar dividers */
+#gif-folders,
+#sticker-folders,
+#music-folders {
+    border-right: 1px solid var(--border-1) !important;
+}
 
 /* ── music: local file list rows ────────────────────────────────────────
    Audio has no natural thumbnail, so local mode is a list of rows

@@ -575,27 +575,6 @@ async function copyImage(msgEl) {
     const t = mediaTarget(msgEl);
     if (!t || t.kind !== "image") return;
 
-    // ── Path 0: gesture-safe bitmap copy from the live, decoded <img> ──────
-    // Must run synchronously inside the click BEFORE any await: execCommand(
-    // "copy") on a selected <img> only produces a real bitmap while there is
-    // still active user activation. Awaiting fetch/decode first drops the
-    // gesture and silently writes an empty clipboard (the root cause of
-    // "copy image does nothing on PC or phone").
-    try {
-        const img = msgEl.querySelector("img.chat-image, img.chat-sticker, img[data-viewer-src]");
-        if (img && img.getAttribute("src") && img.naturalWidth > 0 && img.naturalHeight > 0) {
-            const range = document.createRange();
-            range.selectNode(img);
-            const sel = window.getSelection();
-            sel.removeAllRanges();
-            sel.addRange(range);
-            let ok = false;
-            try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
-            sel.removeAllRanges();
-            if (ok) { toast("Image copied."); return; }
-        }
-    } catch (_) {}
-
     let abs = t.href;
     try { abs = new URL(t.href, location.href).href; } catch (_) {}
 

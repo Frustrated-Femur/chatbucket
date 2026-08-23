@@ -98,11 +98,11 @@ html { scroll-behavior: smooth; }
         transform var(--dur-quick) var(--ease-bounce),
         background var(--dur-quick) var(--ease-smooth),
         color var(--dur-quick) var(--ease-smooth) !important;
+    will-change: transform;
 }
 #send-btn:hover, #attach-btn:hover,
 #sticker-toggle-btn:hover, #gif-toggle-btn:hover, #music-toggle-btn:hover {
     transform: translateY(-1px) scale(1.06);
-    will-change: transform;
 }
 #send-btn:active, #attach-btn:active,
 #sticker-toggle-btn:active, #gif-toggle-btn:active, #music-toggle-btn:active {
@@ -263,6 +263,7 @@ html { scroll-behavior: smooth; }
 /* ── sticker/GIF grid staggered fade-in (very cheap: uses :nth-child) ──── */
 #sticker-grid > *, #gif-grid > *, #giphy-grid > * {
     animation: perf-tile-in 340ms var(--ease-spring) both;
+    will-change: transform, opacity;
 }
 #sticker-grid > *:nth-child(1),  #gif-grid > *:nth-child(1),  #giphy-grid > *:nth-child(1)  { animation-delay:   0ms; }
 #sticker-grid > *:nth-child(2),  #gif-grid > *:nth-child(2),  #giphy-grid > *:nth-child(2)  { animation-delay:  30ms; }
@@ -282,16 +283,17 @@ html { scroll-behavior: smooth; }
 /* Sticker/GIF cell hover lift with GPU-only transform */
 .chat-sticker, #gif-grid > *, #sticker-grid > *, #giphy-grid > * {
     transition: transform 220ms var(--ease-spring), filter 220ms var(--ease-smooth);
+    will-change: transform;
 }
 .chat-sticker:hover, #gif-grid > *:hover, #sticker-grid > *:hover, #giphy-grid > *:hover {
     transform: translate3d(0, -3px, 0) scale(1.04);
     filter: brightness(1.06);
-    will-change: transform;
 }
 
 /* ── attachment preview chip pop ────────────────────────────────────────── */
 .preview-item {
     animation: perf-chip-in 340ms var(--ease-bounce) both;
+    will-change: transform, opacity;
 }
 @keyframes perf-chip-in {
     from { opacity: 0; transform: translate3d(0, 6px, 0) scale(0.9); }
@@ -352,66 +354,3 @@ body.tab-hidden .perf-ripple {
    it on hoverable/animated states so the compositor promotes them only
    while they're actually moving. Nothing to add here — comment for the
    next reader. */
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   ── Missing-but-referenced entry animations (smoothed) ──────────────────────
-   index.js adds .msg-enter / .msg-enter-own / .drawer-opening and removes them
-   on animationend, but they had NO css — so live-message entry and panel-open
-   animations were silently dead. Defined here as transform+opacity only
-   (compositor thread), short, and fully reduced-motion aware.
-   ═══════════════════════════════════════════════════════════════════════════ */
-
-.message.msg-enter {
-    animation: cb-msg-enter 240ms var(--ease-spring) both;
-}
-.message.msg-enter-own {
-    animation: cb-msg-enter-own 240ms var(--ease-spring) both;
-}
-@keyframes cb-msg-enter {
-    from { opacity: 0; transform: translate3d(-10px, 4px, 0) scale(0.985); }
-    to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
-}
-@keyframes cb-msg-enter-own {
-    from { opacity: 0; transform: translate3d(10px, 4px, 0) scale(0.985); }
-    to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
-}
-
-/* Panel drawers: the JS toggles .drawer-opening on open. Slide up + fade. */
-.cb-panel.drawer-opening {
-    animation: cb-drawer-opening 300ms var(--ease-spring) both;
-}
-@keyframes cb-drawer-opening {
-    from { opacity: 0; transform: translate3d(0, 10px, 0); }
-    to   { opacity: 1; transform: translate3d(0, 0, 0); }
-}
-
-/* Chat-screen entry: drop the blur() (expensive on a low-end APU) and use
-   a plain opacity+transform fade. */
-#chat-screen {
-    animation: cb-chat-in 340ms var(--ease-smooth) both;
-}
-@keyframes cb-chat-in {
-    from { opacity: 0; transform: translate3d(0, 8px, 0); }
-    to   { opacity: 1; transform: translate3d(0, 0, 0); }
-}
-
-/* Lazy-image settle: fade WITHOUT blur — blurring a half-loaded image forces
-   a per-frame filter pass on weak GPUs while the user is actively scrolling. */
-#messages img[data-src] {
-    opacity: 0;
-    filter: none;
-}
-#messages img:not([data-src]) {
-    opacity: 1;
-    filter: none;
-}
-
-/* Reduced-motion for the newly-defined (previously dead) entry animations. */
-@media (prefers-reduced-motion: reduce) {
-    .message.msg-enter,
-    .message.msg-enter-own,
-    .cb-panel.drawer-opening,
-    #chat-screen {
-        animation: none !important;
-    }
-}

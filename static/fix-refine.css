@@ -1,0 +1,270 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   ChatBucket — fix-refine.css   (PATCH LAYER · loads AFTER index.css,
+   perf-overlay.css, msg-actions.css and shell-refine.css)
+
+   Companion to fix-refine.js. Same "wins the cascade because it loads
+   last" pattern the earlier overlays use — no !important spam.
+
+   ── WHAT THIS LAYER SOLVES ─────────────────────────────────────────────
+   [A] EDIT-META VISUAL:
+       Give .edit-meta a compositor-friendly appear/disappear so a stray
+       one that our JS is about to sweep never gets a chance to visually
+       "flash" during removal. Also nudges positioning so the timer never
+       gets clipped by the message tail.
+
+   [B] MUSIC-ISLAND SMOOTHNESS:
+       Replace layout-triggering transitions with compositor-only ones.
+         · progress fill: width → transform: scaleX(var(--np-fill))
+         · eq bars:       height → transform: scaleY() from a fixed base
+         · island morph:  add will-change / contain, tune springs, so the
+                          pill→panel expansion no longer stutters on the
+                          2-core APU documented in the codebase.
+       Rules are additive; if fix-refine.js never loads, index.css's
+       existing width/height paths still animate — just without the
+       compositor upgrade.
+
+   [C] TRAY COPY FLASH:
+       A quick green tick on the tray item that fired a copy — consistency
+       with the on-bubble .copy-btn.copied checkmark on desktop.
+
+   All motion here honours prefers-reduced-motion.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+
+/* ─────────────────────────────────────────────────────────────────────────
+   [A] Edit-meta polish + defensive positioning
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* Compositor-only enter — no layout, no paint on siblings. */
+.edit-meta {
+    animation: cb-fix-edit-meta-in 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    will-change: opacity, transform;
+    contain: layout paint;
+}
+@keyframes cb-fix-edit-meta-in {
+    from { opacity: 0; transform: translateY(-2px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* When JS marks the bubble .is-editing, the timer sits directly under the
+   editable field. Nudge it up a hair on file bubbles so the timestamp/
+   badge cluster on the right isn't visually crowded. */
+.message.is-editing .bubble-file .edit-meta,
+.message.is-editing .bubble-audio .edit-meta {
+    margin-top: 4px;
+}
+
+/* If a ghost .edit-meta ever appears WITHOUT an active editable field in
+   the same bubble (the exact state fix-refine.js sweeps), collapse it
+   visually until the JS sweep runs — no reader ever sees the phantom. */
+.message:not(.is-editing) .edit-meta {
+    display: none !important;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   [B] Music-island — compositor-only motion
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* Promote the island to its own layer so morphs don't paint neighbours. */
+.np-island {
+    will-change: transform, opacity;
+    contain: layout paint;
+    /* Slightly softer, more premium spring than the default out-quint — matches
+       the ease the tray & bubbles already use in perf-overlay.css. */
+    transition:
+        opacity 240ms ease,
+        transform 320ms cubic-bezier(0.22, 1, 0.36, 1),
+        width 360ms cubic-bezier(0.22, 1, 0.36, 1),
+        height 360ms cubic-bezier(0.22, 1, 0.36, 1),
+        border-radius 360ms cubic-bezier(0.22, 1, 0.36, 1),
+        padding 360ms cubic-bezier(0.22, 1, 0.36, 1),
+        gap 360ms cubic-bezier(0.22, 1, 0.36, 1),
+        box-shadow 320ms ease;
+}
+
+/* Progress fill: width → transform. index.js writes style.width = "N%"
+   every 500ms; fix-refine.js mirrors that into --np-fill (0..1) on the
+   fill element. We keep width:100% and scale down from the left so
+   the layout box never changes size — pure compositor op. */
+.np-island-progress-fill {
+    /* Base width fixed at 100%; the visible amount is the scale. */
+    width: 100% !important;
+    transform-origin: left center;
+    transform: scaleX(var(--np-fill, 0));
+    /* Smooth catch-up between 500ms ticks. Linear so the bar doesn't
+       ease-in-out into an already-known position. */
+    transition: transform 480ms linear;
+    will-change: transform;
+    backface-visibility: hidden;
+}
+
+/* Eq bars — animate scaleY() instead of height. transform-origin at the
+   bottom so bars still grow "upwards" like a vu-meter. */
+.np-island-eq span {
+    /* Fix the box height to the peak; scale down the visible bar. */
+    height: 16px;
+    transform-origin: 50% 100%;
+    transform: scaleY(0.32);          /* resting height */
+    animation-name: cb-fix-eq-scale;
+    animation-duration: 1.05s;
+    animation-timing-function: cubic-bezier(0.4, 0, 0.4, 1);
+    animation-iteration-count: infinite;
+    animation-play-state: paused;
+    will-change: transform;
+    backface-visibility: hidden;
+}
+.np-island.np-live .np-island-eq span { animation-play-state: running; }
+@keyframes cb-fix-eq-scale {
+    0%, 100% { transform: scaleY(0.32); }
+    50%      { transform: scaleY(1); }
+}
+
+/* Playpause / close buttons — softer, more consistent motion tokens. */
+.np-island-playpause,
+.np-island-playpause-lg,
+.np-island-close {
+    transition:
+        background 180ms ease,
+        transform 180ms cubic-bezier(0.22, 1, 0.36, 1),
+        box-shadow 220ms ease,
+        color 180ms ease;
+    will-change: transform, background;
+}
+.np-island-playpause:hover,
+.np-island-playpause-lg:hover { transform: scale(1.06); }
+.np-island-playpause:active,
+.np-island-playpause-lg:active,
+.np-island-close:active { transform: scale(0.92); }
+
+/* When live, the big playpause pulses subtly rather than staying static —
+   pairs with the existing green-glow ring. Cheap: transform + opacity. */
+.np-island.np-live .np-island-playpause-lg {
+    animation: cb-fix-live-breath 2.4s ease-in-out infinite;
+}
+@keyframes cb-fix-live-breath {
+    0%, 100% { box-shadow: 0 0 0 1px rgba(74,222,128,0.32), 0 0 14px rgba(74,222,128,0.14); }
+    50%      { box-shadow: 0 0 0 1px rgba(74,222,128,0.45), 0 0 26px rgba(74,222,128,0.28); }
+}
+
+/* Ring pulse — sharper attack, gentler tail. Same duration budget so it
+   doesn't visibly desync with the eq bars. */
+.np-island.np-live .np-island-ring {
+    animation: cb-fix-ring-pulse 2.1s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+@keyframes cb-fix-ring-pulse {
+    0%   { transform: scale(0.88); opacity: 0.6; }
+    60%  { transform: scale(1.28); opacity: 0; }
+    100% { transform: scale(1.28); opacity: 0; }
+}
+
+/* Meta text (title/subtitle/kind) fades softly when the island morphs —
+   currently they only get a font-size transition, which is layout-heavy
+   AND janky if the browser can't sub-pixel it. Layer an opacity crossfade
+   on top so the transition reads smooth even if the font-size step
+   snaps. */
+.np-island-title,
+.np-island-subtitle,
+.np-island-kind {
+    transition:
+        font-size 360ms cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 220ms ease;
+    will-change: opacity;
+}
+
+/* Compact-state entrance — the very first time the island appears, give
+   it a small pop from below instead of the current straight fade-down. */
+.np-island.np-visible {
+    animation: cb-fix-island-in 380ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+@keyframes cb-fix-island-in {
+    from { opacity: 0; transform: translateX(-50%) translateY(-18px) scale(0.94); }
+    to   { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+}
+/* But when it morphs between compact <-> expanded, that entrance animation
+   must NOT re-fire. Suppressing via a class the JS already sets on the
+   root — .np-expanded means we're mid-morph, not first-appear. */
+.np-island.np-expanded.np-visible { animation: none; }
+
+/* Expanded panel's contents get a staggered reveal so nothing pops all
+   at once — matches the pill's spring settle. */
+.np-island.np-expanded .np-island-playpause-lg {
+    animation: cb-fix-panel-item-in 320ms cubic-bezier(0.22, 1, 0.36, 1) 60ms both;
+}
+.np-island.np-expanded .np-island-seekrow {
+    animation: cb-fix-panel-item-in 320ms cubic-bezier(0.22, 1, 0.36, 1) 110ms both;
+}
+.np-island.np-expanded .np-island-goto {
+    animation: cb-fix-panel-item-in 320ms cubic-bezier(0.22, 1, 0.36, 1) 160ms both;
+}
+@keyframes cb-fix-panel-item-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Seekbar thumb: softer scaling on grab. */
+.np-island-seek::-webkit-slider-thumb {
+    transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1),
+                box-shadow 220ms ease;
+}
+.np-island-seek:active::-webkit-slider-thumb { transform: scale(1.25); }
+
+/* Prefers-reduced-motion: kill EVERYTHING added above, fall back to a
+   plain fade. This layer must never override the user's accessibility
+   preference set globally in index.css. */
+@media (prefers-reduced-motion: reduce) {
+    .np-island,
+    .np-island-title,
+    .np-island-subtitle,
+    .np-island-kind,
+    .np-island-playpause,
+    .np-island-playpause-lg,
+    .np-island-close { transition: opacity 120ms ease, background 120ms ease !important; animation: none !important; }
+    .np-island-eq span { animation: none !important; transform: scaleY(0.7) !important; }
+    .np-island-ring   { animation: none !important; opacity: 0 !important; }
+    .np-island-progress-fill { transition: none !important; }
+    .edit-meta { animation: none !important; }
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────────
+   [C] Tray "just copied" flash
+   ───────────────────────────────────────────────────────────────────────── */
+
+#cb-tray .cb-mi.cb-fix-just-copied {
+    animation: cb-fix-copied-flash 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes cb-fix-copied-flash {
+    0%   { background: rgba(74, 222, 128, 0.22); }
+    100% { background: transparent; }
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────────
+   [D] Bubble edit-mode focus ring — clearer that a bubble is live editable
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* index.css's .bubble-text.editing outline is 1px dashed & subtle. On
+   busy backgrounds it disappears; bump the contrast without changing
+   the layout dimensions (still an outline, still offset:3px). */
+.bubble-text.editing,
+.bubble-caption.editing {
+    outline-color: color-mix(in srgb, var(--success) 45%, var(--border-3));
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 12%, transparent);
+    transition: box-shadow 200ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+    .bubble-text.editing,
+    .bubble-caption.editing { transition: none; }
+}
+
+
+/* ─────────────────────────────────────────────────────────────────────────
+   [E] Panel tab press feedback
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* The class-driven tab (index.css: .cb-panel-tab.is-active) can now carry a
+   press affordance without stomping the state animation. Compositor-only. */
+.cb-panel-tab:active { transform: scale(0.97); }
+@media (prefers-reduced-motion: reduce) {
+    .cb-panel-tab:active { transform: none; }
+}

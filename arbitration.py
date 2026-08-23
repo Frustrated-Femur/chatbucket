@@ -32,6 +32,7 @@ silently and cause every machine to self-elect host on every boot.
 
 import json
 import random
+import socket
 import subprocess
 import time
 import urllib.error
@@ -203,6 +204,56 @@ def list_tailnet_peers(status_fetcher=None, include_unnamed=False):
     return {"peers": peers, "hidden_count": hidden_count}
 
 
+# ── Live tailnet sweep (bypasses host-state.json entirely) ──────────────
+
+def _find_live_host(my_machine_name, health_checker, peers_fetcher=None):
+    """
+    Live sweep across every known tailnet peer, ignoring host-state.json
+    entirely, to answer one question: is ANYONE actually serving
+    ChatBucket right now, regardless of what the (possibly stale/
+    unsynced) state file claims?
+
+    This exists specifically for the two _arbitrate branches that used
+    to skip verification altogether — "state is empty/stopped" and "I'm
+    already the named host, resume." Both trust local host-state.json at
+    face value, which is exactly what breaks during a Syncthing
+    propagation lag: a machine reboots (crash or otherwise) faster than
+    Syncthing delivers someone else's newer claim, sees its own stale
+    local copy (empty, or still naming itself), and — without this sweep
+    — would self-elect or resume host on top of a genuinely alive host
+    elsewhere. This closes both branches at once, since both need the
+    same answer: "is somebody already alive out there, whatever the file
+    says."
+
+    Returns the first responding peer's name, or None if nobody
+    answered. Checks /health directly and skips a separate Tailscale-
+    online step — list_tailnet_peers() already reports each peer's
+    online state from the same `tailscale status` call, so re-checking
+    it here would just be a second subprocess call for the same answer.
+
+    Deliberately sequential, not parallel — for 2-3 participants this is
+    simple and fast enough (worst case N * HEALTH_CHECK_TIMEOUT if
+    everyone's genuinely down, paid once at claim time, not per doorman
+    click).
+
+    Raises ArbitrationError if the peer list itself is unavailable
+    (surfaced by list_tailnet_peers/_fetch_tailscale_status) — same
+    "don't guess" discipline as the rest of this module.
+    """
+    fetch_peers = peers_fetcher or list_tailnet_peers
+    result = fetch_peers()
+
+    for peer in result["peers"]:
+        if peer["name"].lower() == my_machine_name.lower():
+            continue
+        if not peer["online"]:
+            continue
+        if health_checker(peer["name"]):
+            return peer["name"]
+
+    return None
+
+
 # ── App-level health check ──────────────────────────────────────────────
 
 def _real_health_checker(machine_name):
@@ -227,7 +278,8 @@ def _real_health_checker(machine_name):
 
 # ── Core arbitration ─────────────────────────────────────────────────────
 
-def should_i_be_host(my_machine_name, tailscale_checker=None, health_checker=None):
+def should_i_be_host(my_machine_name, tailscale_checker=None, health_checker=None,
+                     port_free_checker=None):
     """
     The arbitration decision from §3 of the architecture doc.
 
@@ -242,27 +294,60 @@ def should_i_be_host(my_machine_name, tailscale_checker=None, health_checker=Non
     subprocess/urllib directly — keeps tests readable and decoupled from
     implementation details of the real checkers.
 
+    port_free_checker: injectable no-arg callable returning bool. Front-door
+    integration NEEDS this: under the front-door design, the caller (front
+    door) already owns port 5000 for its entire lifetime, so a default
+    _port_is_free(5000) check would ALWAYS fail on the machine legitimately
+    about to claim — it's checking the wrong port. The front door passes a
+    checker for :5001 (the child's port) instead. Legacy callers (the
+    module's __main__ block, or the old execv-based main.py, both of which
+    ARE about to bind :5000 themselves) get the historical behavior by
+    leaving this None.
+
     Callers must bind the application port after this call — see module
     docstring.
     """
     tailscale_checker = tailscale_checker or _real_tailscale_checker
     health_checker = health_checker or _real_health_checker
+    port_free_checker = port_free_checker or (lambda: _port_is_free(APP_PORT))
 
-    return _arbitrate(my_machine_name, tailscale_checker, health_checker, MAX_CLAIM_RETRIES)
+    return _arbitrate(my_machine_name, tailscale_checker, health_checker,
+                      port_free_checker, MAX_CLAIM_RETRIES)
 
 
-def _arbitrate(my_machine_name, tailscale_checker, health_checker, retries_left):
+def _arbitrate(my_machine_name, tailscale_checker, health_checker, port_free_checker, retries_left):
     state = host_state.read_state()
 
-    # §3 step 2: nobody hosting, or previous host cleanly stopped.
+    # §3 step 2: nobody hosting, or previous host cleanly stopped — per
+    # the local file. Don't trust that at face value: it can be stale if
+    # Syncthing hasn't yet delivered someone else's newer claim. Sweep
+    # the tailnet for a live host before concluding "nobody's hosting."
     if state is None or state["action"] == "stop":
-        return _claim_host(my_machine_name, tailscale_checker, health_checker, retries_left, state)
+        live_host = _find_live_host(my_machine_name, health_checker)
+        if live_host is not None:
+            # Somebody's genuinely running — the local file just hasn't
+            # caught up yet. Defer, and heal the local copy to match
+            # reality so doorman (which trusts the file blindly, with no
+            # network calls of its own) stops pointing at nothing.
+            host_state.write_state("start", live_host)
+            return False
+        return _claim_host(my_machine_name, tailscale_checker, health_checker,
+                           port_free_checker, retries_left, state)
 
     claimed_machine = state["machine"]
 
-    # I was host last (e.g. I just rebooted) — resume. Refresh timestamp.
+    # I was host last (e.g. I just rebooted) — before resuming, confirm
+    # nobody else took over the claim while I was down. Same rationale
+    # as above: a crash + fast reboot can race ahead of Syncthing, so
+    # "the file still names me" isn't proof nobody else has since taken
+    # the claim for real.
     if claimed_machine == my_machine_name:
-        return _claim_host(my_machine_name, tailscale_checker, health_checker, retries_left, state)
+        live_host = _find_live_host(my_machine_name, health_checker)
+        if live_host is not None:
+            host_state.write_state("start", live_host)
+            return False
+        return _claim_host(my_machine_name, tailscale_checker, health_checker,
+                           port_free_checker, retries_left, state)
 
     # Someone else claims host — verify before deferring. §3 step 3.
     try:
@@ -275,16 +360,50 @@ def _arbitrate(my_machine_name, tailscale_checker, health_checker, retries_left)
         raise
 
     if not online:
-        return _claim_host(my_machine_name, tailscale_checker, health_checker, retries_left, state)
+        return _claim_host(my_machine_name, tailscale_checker, health_checker,
+                           port_free_checker, retries_left, state)
 
     if health_checker(claimed_machine):
         return False  # genuinely alive — defer
 
     # On the tailnet but app isn't answering — stale claim, crashed process.
-    return _claim_host(my_machine_name, tailscale_checker, health_checker, retries_left, state)
+    return _claim_host(my_machine_name, tailscale_checker, health_checker,
+                       port_free_checker, retries_left, state)
 
 
-def _claim_host(my_machine_name, tailscale_checker, health_checker, retries_left, state_before_jitter):
+def _port_is_free(port, host="0.0.0.0"):
+    """
+    Best-effort check: can we bind `port` on this machine right now?
+
+    Checked immediately before writing a host claim (see _claim_host).
+    Guards against the exact failure seen in testing: arbitration wrote
+    {"action":"start","machine":"archlinux"} to host-state.json, then
+    gunicorn tried to bind port 5000 and failed because a leftover
+    doorman.py from an earlier manual run was still holding it. The
+    claim was already written — and synced to other machines — before
+    the bind failure ever surfaced, so every doorman on the tailnet
+    (including this machine's own leftover one) started redirecting
+    people to a machine that was never actually running a server,
+    producing a self-redirect loop.
+
+    This can't fully close the window — the port could still be taken
+    by something else in the brief gap between this check and the real
+    bind a moment later (TOCTOU race) — but it catches the common case:
+    a leftover process already sitting on the port from an earlier
+    manual run, exactly like that scenario. That's nearly all of the
+    fixable window.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def _claim_host(my_machine_name, tailscale_checker, health_checker,
+                port_free_checker, retries_left, state_before_jitter):
     """
     §3 step 4: jitter, re-check, commit — or back off if the ground truth
     changed during our jitter window.
@@ -317,7 +436,20 @@ def _claim_host(my_machine_name, tailscale_checker, health_checker, retries_left
         # Ground truth changed while we slept — re-evaluate from scratch
         # against whatever it is now, rather than trusting a decision made
         # against stale information.
-        return _arbitrate(my_machine_name, tailscale_checker, health_checker, retries_left - 1)
+        return _arbitrate(my_machine_name, tailscale_checker, health_checker,
+                          port_free_checker, retries_left - 1)
+
+    if not port_free_checker():
+        # Under the front door, this checker probes :5001 (the child's
+        # port), NOT :5000 (permanently held by the front door). Same
+        # spirit as before — refuse to write a claim we can't back —
+        # just against the port that actually matters now.
+        raise ArbitrationError(
+            "The port needed to back a host claim is already in use on "
+            "this machine — refusing to write a claim I can't actually "
+            "back. Usually a leftover ChatBucket child process; kill it "
+            "and retry."
+        )
 
     host_state.write_state("start", my_machine_name)
     return True

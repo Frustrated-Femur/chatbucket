@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-16"?>
 <!--
-  ChatBucket autostart task for Win1/Win2.
+  ChatBucket autostart task for Win1/Win2 (front-door architecture).
 
   Install (one-time, on each Windows machine, elevated PowerShell):
     schtasks /Create /TN "ChatBucket" /XML scripts\chatbucket-win-task.xml
@@ -12,12 +12,26 @@
                        (`where python` in cmd will tell you)
 
   Design notes:
+    * Under the front-door architecture, main.py starts the persistent
+      front_door.run() loop — one long-lived Python process that owns
+      port 5000 for its entire lifetime. This is a different process
+      shape from the old design (which execv'd itself into gunicorn
+      or doorman), but the launcher-level contract is identical: one
+      task, one process, one PID per machine. The XML below did not
+      need to be redesigned around the new lifecycle — the properties
+      already selected (MultipleInstancesPolicy=IgnoreNew, ExecutionTimeLimit=PT0S,
+      RestartOnFailure semantics) fit the front door even more naturally
+      than they fit the old execv chain.
     * Runs at logon, not at boot. Boot-time start would fire before
       Syncthing/Tailscale user services are up on a default Windows
-      install, causing arbitration to fail on tailscale-CLI-unusable
-      grounds and the machine to refuse to start (arbitration.py
-      correctly refuses to guess). Logon start avoids that ordering
-      problem without extra service-dependency plumbing.
+      install, causing initial arbitration to fail on
+      tailscale-CLI-unusable grounds. Under the front door, initial
+      arbitration failure is now recoverable at runtime (the manager
+      can flip auto_host on, or a subsequent CONFIG_CHANGED / manual
+      rearbitrate call retries) — the process stays alive as a redirect-
+      only front door regardless — but starting cleanly is still
+      preferable to starting into an error state, so the logon trigger
+      is kept.
     * DelayedStart of 30s gives Tailscale + Syncthing a chance to
       settle before arbitration reads state/host-state.json and calls
       `tailscale status --json`.
@@ -25,11 +39,19 @@
       = false because these are desktops on mains; the defaults would
       wrongly refuse to start on a laptop running on battery.
     * ExecutionTimeLimit = PT0S disables the 72h auto-kill. This
-      process is meant to run indefinitely.
+      process is meant to run indefinitely (that is the whole point
+      of the front-door design — the process must NEVER be recycled
+      by the OS under it, or port 5000 briefly goes dark).
+    * MultipleInstancesPolicy = IgnoreNew is the belt: even if the
+      scheduler somehow fires this task twice (e.g. two rapid logons),
+      the second instance is suppressed. The braces underneath is the
+      front door's own port-5000 bind — a duplicate would fail to bind
+      and exit fast — so we have layered protection against ever
+      running two front doors on one machine.
 -->
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>ChatBucket autostart (main.py — arbitration + host or doorman).</Description>
+    <Description>ChatBucket front-door autostart (persistent supervisor process).</Description>
     <URI>\ChatBucket</URI>
   </RegistrationInfo>
   <Triggers>

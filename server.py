@@ -1,6 +1,7 @@
 from flask import Flask, send_from_directory, jsonify, request, redirect
 from flask_sock import Sock
 from werkzeug.utils import secure_filename
+import hashlib
 import json
 import os
 import threading
@@ -15,12 +16,17 @@ import yt_dlp
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import bisect
 
 # ── tunables ──────────────────────────────────────────────────────────
 PAGE_SIZE          = 50    # messages per /history page
 DOM_CAP            = 400   # max messages kept in browser DOM
 
-RAM_CAP            = 200   # max lines held in server RAM ring-buffer
+# RAM-first guidance: the warm message index below keeps every message in
+# memory by design (this is a cheap, deliberate RAM-for-speed trade). The
+# number is a soft ceiling for log-style sanity, NOT enforced — enforcing it
+# would break pagination by dropping messages the client still needs to fetch.
+RAM_CAP            = 50000
 YTDLP_SEARCH_PAGE_SIZE = 10
 MAX_FILE_SIZE_MB   = 100
 MAX_CONTENT_LENGTH = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -481,26 +487,159 @@ def _msg_id_to_path(msg_id):
     return os.path.join("messages", f"{safe_id}.json")
 
 
+# ── warm in-memory message index ──────────────────────────────────────
+# The plan's #1 server win: stop doing a full directory scan + parse + sort
+# on EVERY /history request. We keep the entire message set in RAM (the
+# stated RAM-for-speed trade — a few hundred KB even for huge histories),
+# maintained incrementally on every write, and revalidated cheaply against
+# the directory mtime so externally-synced files (Syncthing) can't leave us
+# serving a stale view.
+#
+#   _messages       — list of message dicts, ascending by timestamp string
+#   _ts_keys        — parallel list of `timestamp` strings for O(log n) bisect
+#   _messages_by_id — id -> message dict
+#
+# All access goes through _index_lock (an RLock so the helpers can nest).
+_messages       = []
+_ts_keys        = []
+_messages_by_id = {}
+_index_lock     = threading.RLock()
+_index_loaded   = False
+_dir_mtime_ns   = 0
+
+
+def _load_index_locked():
+    """Full cold-start read. Exactly one directory scan per process (plus one
+    more each time the directory mtime tells us an external change landed)."""
+    global _messages, _ts_keys, _messages_by_id
+    msgs = []
+    try:
+        for fname in os.listdir("messages"):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join("messages", fname), "r", encoding="utf-8") as f:
+                    msgs.append(json.load(f))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    msgs.sort(key=lambda m: m.get("timestamp", ""))
+    _messages = msgs
+    _ts_keys = [m.get("timestamp", "") for m in msgs]
+    _messages_by_id = {}
+    for m in msgs:
+        mid = m.get("id")
+        if mid:
+            _messages_by_id[mid] = m
+
+
+def _ensure_index():
+    """Cheap call-site: (re)build the index only if cold or externally stale."""
+    global _index_loaded, _dir_mtime_ns
+    with _index_lock:
+        stale = False
+        try:
+            st = os.stat("messages")
+            stale = (st.st_mtime_ns != _dir_mtime_ns)
+        except OSError:
+            stale = not _index_loaded
+        if not _index_loaded or stale:
+            _load_index_locked()
+            try:
+                _dir_mtime_ns = os.stat("messages").st_mtime_ns
+            except OSError:
+                _dir_mtime_ns = 0
+            _index_loaded = True
+
+
+def _index_upsert(msg):
+    """Insert/replace a message in the warm index, keeping _ts_keys sorted."""
+    mid = msg.get("id")
+    if not mid:
+        return
+    with _index_lock:
+        if mid in _messages_by_id:
+            _messages[:] = [m for m in _messages if m.get("id") != mid]
+            _ts_keys[:]  = [m.get("timestamp", "") for m in _messages]
+        _messages_by_id[mid] = msg
+        ts = msg.get("timestamp", "")
+        # Fast path: live messages are (almost) always the newest — O(1) append.
+        if not _ts_keys or _ts_keys[-1] <= ts:
+            _messages.append(msg)
+            _ts_keys.append(ts)
+        else:
+            i = bisect.bisect_left(_ts_keys, ts)
+            _messages.insert(i, msg)
+            _ts_keys.insert(i, ts)
+
+
 def _write_message(msg):
-    """Write a single message as its own JSON file."""
+    """Write a single message as its own JSON file and keep the warm index
+    current in the same pass."""
+    global _dir_mtime_ns
     fpath = _msg_id_to_path(msg.get("id"))
     with _file_lock:
         with open(fpath, "w", encoding="utf-8") as f:
             json.dump(msg, f)
+    # Our own writes deliberately bypass dir-mtime revalidation: the index is
+    # updated to match the moment the file is committed.
+    _index_upsert(msg)
+    try:
+        _dir_mtime_ns = os.stat("messages").st_mtime_ns
+    except OSError:
+        pass
 
 
 def _read_message_by_id(msg_id):
-    """Read a single message file by id. Returns None if missing/corrupt —
-    never raises, since a missing/bad id from a delete/edit request should
-    just be a silent no-op, not a crash."""
+    """Read a single message by id from the warm index, falling back to disk
+    (and auto-absorbing the file into the index) when a Syncthing/out-of-band
+    file landed without a directory-scan yet. Never raises."""
+    if not msg_id:
+        return None
+    _ensure_index()
+    with _index_lock:
+        m = _messages_by_id.get(msg_id)
+        if m is not None:
+            return m
     try:
         with open(_msg_id_to_path(msg_id), "r", encoding="utf-8") as f:
-            return json.load(f)
+            m = json.load(f)
+        if m and m.get("id") == msg_id:
+            _index_upsert(m)
+            return m
     except Exception:
-        return None
+        pass
+    return None
 
 
 EDIT_WINDOW_SECONDS = 15 * 60  # requested range was 15-20 min; 15 is the default
+
+
+def _any_other_message_references_file(filename, exclude_id):
+    """
+    True if some message OTHER than exclude_id still points at this exact
+    uploaded filename.
+
+    Needed because upload dedup (see /upload) means multiple messages can
+    legitimately share one physical file — e.g. the same gif sent 3 times
+    now writes 1 file backing 3 messages. Without this check, deleting any
+    ONE of those messages would remove the file out from under the other
+    two, silently 404-ing an image/gif/video that's still visible in
+    someone else's un-deleted message. Scans messages/ directly rather
+    than trusting any cached count, same "don't guess" discipline as the
+    rest of this codebase's disk-state handling.
+    """
+    _ensure_index()
+    with _index_lock:
+        for other in _messages:
+            if str(other.get("id")) == str(exclude_id):
+                continue
+            if (other.get("type") == "file"
+                    and not other.get("deleted")
+                    and other.get("filename") == filename):
+                return True
+    return False
 
 
 def _delete_uploaded_file_for(msg):
@@ -508,11 +647,19 @@ def _delete_uploaded_file_for(msg):
     message is deleted. Never fatal — an already-gone file, or a filename
     that's actually a remote URL (defensive; the current upload flow
     always uploads first, so this shouldn't happen), just means there's
-    nothing local left to clean up."""
+    nothing local left to clean up.
+
+    Dedup-safe: only actually removes the file from disk when no other
+    live message still references it (see _any_other_message_references_file
+    above) — otherwise this would be a data-loss bug for every message
+    still sharing a deduped file with the one being deleted.
+    """
     if msg.get("type") != "file":
         return
     filename = msg.get("filename") or ""
     if not filename or filename.startswith("http"):
+        return
+    if _any_other_message_references_file(filename, exclude_id=msg.get("id")):
         return
     fpath = os.path.join(UPLOAD_FOLDER, filename)
     try:
@@ -557,30 +704,37 @@ def _write_youtube_meta(msg):
         pass
 
 def _read_messages(before=None, after=None, limit=PAGE_SIZE):
-    """Read all message files, sort by timestamp, apply filter + limit."""
-    msgs = []
-    try:
-        for fname in os.listdir("messages"):
-            if not fname.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join("messages", fname), "r", encoding="utf-8") as f:
-                    msgs.append(json.load(f))
-            except Exception:
-                pass
-    except Exception:
-        return []
-    msgs.sort(key=lambda m: m.get("timestamp", ""))
-    if before:
-        msgs = [m for m in msgs if m.get("timestamp", "") < before]
+    """Answer a /history page from the warm in-memory index via bisect —
+    O(log n) to locate the boundary, O(limit) to copy the slice. No directory
+    scan, no per-file JSON parse, no full sort on every request.
+
+    (Syncthing/out-of-band files are handled by _ensure_index's cheap mtime
+    revalidation: when the directory mtime changes, we reload once, then serve
+    from RAM again.)
+    """
+    _ensure_index()
+    with _index_lock:
+        msgs = _messages
+        keys = _ts_keys
+        if before:
+            i = bisect.bisect_left(keys, before)
+            return msgs[:i][-limit:]
+        if after:
+            # Earliest N *after* the cutoff (ascending), not the latest overall —
+            # this fills the gap forward from where the client left off instead
+            # of jumping straight to the present.
+            i = bisect.bisect_right(keys, after)
+            return msgs[i:i + limit]
         return msgs[-limit:]
-    if after:
-        # Earliest N *after* the cutoff (ascending), not the latest overall —
-        # this fills the gap forward from where the client left off instead
-        # of jumping straight to the present.
-        msgs = [m for m in msgs if m.get("timestamp", "") > after]
-        return msgs[:limit]
-    return msgs[-limit:]
+
+# Warm the index once at boot (runs at import under both gunicorn and the
+# threaded __main__ server), so the very first /history is already a RAM hit
+# and never pays the cold full-scan+parse+sort cost.
+try:
+    _ensure_index()
+    print(f"[startup] message index warmed: {len(_messages)} messages in RAM")
+except Exception as _e:
+    print(f"[startup] message index warm-up skipped: {_e}")
 
 def _online_usernames():
     with _users_lock:
@@ -631,6 +785,30 @@ def _safe_upload_name(raw_name, fallback_base="file"):
     if ext and not ext.startswith("."):
         ext = "." + ext
     return base, ext
+
+CONTENT_HASH_LEN = 12  # hex chars — plenty of collision safety for a
+                        # few-thousand-file friend-group history, short
+                        # enough to keep filenames readable
+
+
+def _content_hash(file_storage, chunk_size=1024 * 1024):
+    """
+    Hash an uploaded file's bytes, streamed in chunks so a 100MB video
+    doesn't get pulled into memory whole just to name it.
+
+    Leaves file_storage's stream positioned at 0 afterward — .save()
+    (or a second read) still works normally after this returns.
+    """
+    file_storage.stream.seek(0)
+    h = hashlib.sha256()
+    while True:
+        chunk = file_storage.stream.read(chunk_size)
+        if not chunk:
+            break
+        h.update(chunk)
+    file_storage.stream.seek(0)
+    return h.hexdigest()[:CONTENT_HASH_LEN]
+
 
 def _safe_send(ws, data):
     """Serialize all writes to a given socket.
@@ -740,12 +918,19 @@ def upload_file():
     if not file:
         return {"error": "No file"}, 400
 
-    timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    random_suffix = secrets.token_hex(4)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     cleaned_base, extension = _safe_upload_name(file.filename)
-    filename  = f"{timestamp}_{random_suffix}_{cleaned_base}{extension}"
-    filepath  = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(filepath)
+
+    # Content-addressed filename: identical bytes always hash to the same
+    # name, so re-sending a gif/photo/song reuses the file already on disk
+    # instead of writing (and later Syncthing-replicating to every peer) a
+    # second full copy of something byte-for-byte identical to one we
+    # already have.
+    content_hash = _content_hash(file)
+    filename = f"{content_hash}_{cleaned_base}{extension}"
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.exists(filepath):
+        file.save(filepath)
 
     now        = datetime.now()
     msg_id     = request.form.get("id") or \
@@ -820,11 +1005,29 @@ def websocket(ws):
             if msg_type == "delete":
                 target_id = msg.get("id")
                 target = _read_message_by_id(target_id) if target_id else None
-                if target is None or target.get("deleted") or target.get("user") != username:
-                    # Unknown id, already deleted, or not the owner — the
-                    # client only ever shows the delete button on the
-                    # sender's own messages, so a mismatch here is either a
-                    # stale UI or a crafted request. Either way: no-op.
+                if target is None:
+                    # Unknown id — tell the sender so a stale/racing client
+                    # (or a genuinely dropped write) doesn't just hang.
+                    _safe_send(ws, json.dumps({
+                        "type": "delete_result", "id": target_id,
+                        "ok": False, "reason": "not_found",
+                    }))
+                    continue
+                if target.get("user") != username:
+                    _safe_send(ws, json.dumps({
+                        "type": "delete_result", "id": target_id,
+                        "ok": False, "reason": "not_owner",
+                    }))
+                    continue
+                if target.get("deleted"):
+                    # Idempotent: already deleted. Re-broadcast the delete so a
+                    # client that missed the first broadcast still converges,
+                    # and confirm success to the sender.
+                    _broadcast(json.dumps({"type": "delete", "id": target_id}))
+                    _safe_send(ws, json.dumps({
+                        "type": "delete_result", "id": target_id,
+                        "ok": True, "already": True,
+                    }))
                     continue
                 _delete_uploaded_file_for(target)
                 tombstone = {
@@ -835,8 +1038,15 @@ def websocket(ws):
                     "time": target.get("time", ""),
                     "deleted": True,
                 }
+                # Preserve the reply thread so "Message deleted" never breaks
+                # a reply-quote pointing at this message from another bubble.
+                if target.get("replyTo"):
+                    tombstone["replyTo"] = target["replyTo"]
                 _write_message(tombstone)
                 _broadcast(json.dumps({"type": "delete", "id": target_id}))
+                _safe_send(ws, json.dumps({
+                    "type": "delete_result", "id": target_id, "ok": True,
+                }))
                 continue
 
             if msg_type == "edit":
@@ -845,6 +1055,10 @@ def websocket(ws):
                 target = _read_message_by_id(target_id) if target_id else None
 
                 if target is None or target.get("deleted") or target.get("user") != username:
+                    _safe_send(ws, json.dumps({
+                        "type": "edit_result", "id": target_id,
+                        "ok": False, "reason": "rejected",
+                    }))
                     continue
 
                 # Editable content types only — stickers/YouTube/ytdlp shares
@@ -1334,4 +1548,16 @@ def request_entity_too_large(error):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    # Under the front-door architecture, server.py runs as a SUPERVISED
+    # CHILD of front_door.py and binds LOOPBACK ONLY. Nothing outside
+    # this machine may reach the app server directly — the front door
+    # (on port 5000, tailnet-facing) is the only path in.
+    #
+    # threaded=True is retained deliberately: flask_sock's WebSocket
+    # transport documents Werkzeug's threaded dev server as one of the
+    # two servers (alongside gunicorn+gevent) that support the
+    # socket-hijack path WS upgrade needs. This path runs when gunicorn
+    # isn't available (Windows, or POSIX without gunicorn installed);
+    # front_door.py's _spawn_child_command() picks between gunicorn
+    # (bound to 127.0.0.1:5001) and this __main__ block accordingly.
+    app.run(host="127.0.0.1", port=5001, threaded=True)

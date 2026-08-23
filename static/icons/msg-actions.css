@@ -30,10 +30,8 @@
      · every animation is opacity/transform only (compositor thread)
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* --cb-spring, --cb-glass, --cb-smoke, --cb-blur, --cb-cast, --cb-lip are
-   now defined once in index.css :root. This file only owns the tokens it
-   is the sole consumer of. */
 :root {
+    --cb-spring:      cubic-bezier(0.16, 1, 0.30, 1);
     --cb-tray-bg:     linear-gradient(180deg, #1b1b1b 0%, #0d0d0d 100%);
     --cb-tray-edge:   #4a4a4a;
     --cb-tray-shadow: 0 20px 52px rgba(0, 0, 0, 0.76), 0 2px 8px rgba(0, 0, 0, 0.6);

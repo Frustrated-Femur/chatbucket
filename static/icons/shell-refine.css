@@ -23,13 +23,28 @@
       on a 360px phone, long reply-to usernames).
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* --cb-spring, --cb-snap, --cb-exit, --cb-t-micro/quick/panel and the
-   glass/smoke/blur/cast/lip tokens are now defined once in index.css
-   :root. Only file-local variants live here. */
 :root {
+    /* ── motion: one scale, shared with msg-actions.css ────────────────────
+       --cb-spring is already defined there; redeclaring the same value is
+       harmless and keeps this file load-order independent. */
+    --cb-spring:   cubic-bezier(0.16, 1, 0.30, 1);   /* settle, no overshoot */
+    --cb-snap:     cubic-bezier(0.34, 1.4, 0.64, 1); /* light overshoot      */
+    --cb-exit:     cubic-bezier(0.4, 0, 1, 1);       /* leaving is faster    */
+    --cb-t-micro:  120ms;
+    --cb-t-quick:  190ms;
+    --cb-t-panel:  280ms;
+
+    /* ── smoked glass — floating surfaces ONLY ────────────────────────────── */
+    --cb-glass:        linear-gradient(180deg, rgba(255,255,255,0.055) 0%,
+                                               rgba(255,255,255,0.022) 42%,
+                                               rgba(255,255,255,0.008) 100%);
     --cb-glass-strong: linear-gradient(180deg, rgba(255,255,255,0.085) 0%,
                                                rgba(255,255,255,0.030) 46%,
                                                rgba(255,255,255,0.010) 100%);
+    --cb-smoke:        rgba(10, 10, 10, 0.72);
+    --cb-lip:          inset 0 1px 0 rgba(255,255,255,0.10);
+    --cb-cast:         0 18px 44px rgba(0,0,0,0.66), 0 2px 10px rgba(0,0,0,0.5);
+    --cb-blur:         blur(20px) saturate(155%);
 }
 
 /* ═══ 1 · PRESENCE: one line, scrollable, names only ═══════════════════════ */

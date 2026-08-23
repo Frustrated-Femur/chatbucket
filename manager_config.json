@@ -1,1 +1,14 @@
-{"syncthing_api_key": "Qs2y6SXAYJApHRwxCY59izspeqnXNjSX"}
+{
+  "syncthing_api_key": "Qs2y6SXAYJApHRwxCY59izspeqnXNjSX",
+  "managed": {
+    "map": {
+      "chatbucket-gifs": true,
+      "chatbucket-messages": true,
+      "chatbucket-presence": true,
+      "chatbucket-sfx": true,
+      "chatbucket-state": true,
+      "chatbucket-stickers": true,
+      "chatbucket-uploads": true
+    }
+  }
+}

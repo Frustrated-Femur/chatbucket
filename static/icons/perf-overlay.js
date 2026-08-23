@@ -125,24 +125,6 @@ if (typeof window.dateLabel === "function") {
     setInterval(wipe, 60 * 60 * 1000); // hourly; cheap, guarantees freshness
 }
 
-// 1e. dateKey memoisation — reconcileDateSeparators() recomputes a
-//     "YYYY-M-D" string for every visible message on EVERY insertion/trim, and
-//     trimDOMTop/Bottom + loadOlder/Newer call it again on the same timestamps.
-//     Timestamps are immutable per message (edits keep the same ts), so this is
-//     a safe permanent cache.
-if (typeof window.dateKey === "function") {
-    const _origKey = window.dateKey;
-    const keyCache = new Map();
-    window.dateKey = function dateKey_fast(ts) {
-        if (ts == null) return "";
-        let hit = keyCache.get(ts);
-        if (hit !== undefined) return hit;
-        hit = _origKey(ts);
-        keyCache.set(ts, hit);
-        return hit;
-    };
-}
-
 // ── 2. requestAnimationFrame batcher ────────────────────────────────────────
 // Two queues: reads (measure) then writes (mutate). Prevents layout thrash
 // caused by interleaved reads/writes hitting forced-synchronous-layout.
@@ -501,83 +483,7 @@ if (typeof window.updateOnlineStatus === "function") {
     };
 }
 
-// ── 15. Opt-in performance instrumentation HUD ─────────────────────────────
-// OFF by default (zero cost). Run  window.__cbPerf.enable()  in DevTools to see
-// rolling FPS + frame-time + long-task + DOM-diagnostics without installing
-// anything. Useful for the manual benchmarks the perf plan asks for.
-(() => {
-    let running = false, rafId = 0, styleEl = null;
-    const f = { fps: 0, ms: 0, longTasks: 0, domNodes: 0, msgNodes: 0, maxFrame: 0 };
-    let lastT = performance.now(), frames = 0, worst = 0;
-    let sweepId = 0, msAcc = 0, msN = 0;
-
-    function ensureStyle() {
-        if (styleEl) return styleEl;
-        styleEl = document.createElement("style");
-        styleEl.textContent = `
-#cb-perf-hud{position:fixed;right:10px;top:10px;z-index:2147483646;
-font:11px/1.45 ui-monospace,Menlo,Consolas,monospace;color:#7db9ff;
-background:rgba(5,8,12,.86);border:1px solid rgba(125,185,255,.35);
-border-radius:8px;padding:8px 10px;pointer-events:none;user-select:none;
-backdrop-filter:blur(6px);white-space:pre;}
-#cb-perf-hud b{color:#fff;font-weight:600;}
-#cb-perf-hud .warn{color:#ffb454;}#cb-perf-hud .bad{color:#ff7b72;}`;
-        document.head.appendChild(styleEl);
-        return styleEl;
-    }
-    function ensureEl() {
-        ensureStyle();
-        let el = document.getElementById("cb-perf-hud");
-        if (!el) { el = document.createElement("div"); el.id = "cb-perf-hud"; document.body.appendChild(el); }
-        return el;
-    }
-    function cls(ms) { return ms > 33 ? "bad" : (ms > 16.7 ? "warn" : ""); }
-    function render() {
-        const el = ensureEl();
-        const nodes = document.getElementsByTagName("*").length;
-        const msgs = document.querySelectorAll("#messages .message").length;
-        el.innerHTML =
-            `<b>${String(f.fps).padStart(3," ")}</b> fps · ` +
-            `<span class="${cls(f.ms)}">${f.ms.toFixed(1)}ms</span> frame · ` +
-            `<span class="${cls(f.maxFrame)}">${f.maxFrame.toFixed(1)}ms max</span>\n` +
-            `long tasks ${f.longTasks} · DOM ${nodes} · msgs ${msgs}`;
-    }
-    function loop(t) {
-        if (!running) return;
-        const dt = t - lastT; lastT = t;
-        msAcc += dt; msN++; frames++;
-        if (dt > 50) f.longTasks++;
-        if (dt > worst) worst = Math.min(dt, 500);
-        if (msAcc >= 500) {
-            f.fps = Math.round((frames * 1000) / msAcc);
-            f.ms = msAcc / frames;
-            f.maxFrame = worst;
-            msAcc = 0; msN = 0; frames = 0; worst = 0;
-            f.domNodes = 0; f.msgNodes = 0;
-            render();
-        }
-        rafId = requestAnimationFrame(loop);
-    }
-    window.__cbPerf = {
-        enable() {
-            if (running) return this;
-            running = true; lastT = performance.now();
-            render();
-            rafId = requestAnimationFrame(loop);
-            console.info("[perf] HUD enabled — window.__cbPerf.disable() to stop.");
-            return this;
-        },
-        disable() {
-            running = false;
-            cancelAnimationFrame(rafId);
-            document.getElementById("cb-perf-hud")?.remove();
-            return this;
-        },
-        get snapshot() { return { ...f }; },
-    };
-})();
-
-// ── 16. Boot: mark that overlay is live so DevTools shows it in a probe ───
+// ── 15. Boot: mark that overlay is live so DevTools shows it in a probe ───
 window.__perfOverlay = {
     version: 1,
     caches: {
