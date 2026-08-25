@@ -1,27 +1,27 @@
 //! chatbucket-manager (Rust) — native GUI manager for ChatBucket.
 //!
-//! Front-door integration (v0.3):
+//! Migrated from the pywebview-based Python `manager_main.py`. Key improvements:
 //!
-//!   * Role/Process state now comes from the front door's loopback
-//!     status endpoint (127.0.0.1:5050/status) via `front_door_client`.
-//!     `process_scan` remains only as an explicit "front door
-//!     unreachable" fallback — see manager.rs::derive_role_state.
-//!   * Start/Stop POST to the front door's /control endpoint; the
-//!     supervisor owns child lifecycle. The Manager no longer spawns
-//!     or signals Python processes itself.
-//!   * The legacy `sync-state` single-folder probe is deleted; all
-//!     Syncthing state flows through the structured SyncSnapshot.
-//!   * Network tab holds only Tailnet Peers; Syncthing Config moved
-//!     to the Sync tab (integration.md §2).
-//!   * Same "one source of truth" discipline: `derive_role_state()`
-//!     is the ONLY reducer of role state; the tray path, rail rows,
-//!     and window cards all read it — never re-derived independently.
+//!   * No WebView dependency (no webkit2gtk on Linux, no WebView2 on Windows).
+//!   * Native egui GUI — single self-contained binary.
+//!   * Same design tokens as `web/index.html` (surface stack, --success/--warn/
+//!     --danger colors) so it visually reads as part of ChatBucket.
+//!   * Same "one source of truth" discipline that §16.5 of the architecture doc
+//!     established for Role state: `derive_role_state()` is the ONLY function
+//!     that reduces (claim, process, arbitration) into a UI label. The tray
+//!     path and window path both call it — never re-derive independently.
+//!   * Background worker thread does status polling + start/stop/update work,
+//!     so the GUI thread never blocks on `tailscale status` (up to 5s) or on a
+//!     STOP_GRACE_SECONDS-long wait.
+//!
+//! Module wiring is unchanged from v0.2; the initial window size grew to fit
+//! the left navigation rail, and a Sync tab was added for the Syncthing
+//! control plane (manager-syncthing-setup_4.md).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod arbitration;
-mod front_door_client;
 mod host_state;
 mod manager;
 mod process_scan;
@@ -62,7 +62,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 720.0])
+            .with_inner_size([880.0, 720.0]) // wider — rail needs 220 px
             .with_min_inner_size([760.0, 620.0])
             .with_title("ChatBucket Manager"),
         ..Default::default()

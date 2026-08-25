@@ -1,41 +1,19 @@
-//! process_scan.rs — Find ChatBucket lifecycle processes (FALLBACK ONLY).
+//! process_scan.rs — Find ChatBucket lifecycle processes.
 //!
-//! Under the front-door architecture (front_door.py + tcp_proxy.py) this
-//! scanner is a FALLBACK, not the primary source of truth. `manager.rs`
-//! polls 127.0.0.1:5050/status first and only walks the OS process
-//! table if the front door is unreachable. See integration.md §4 for
-//! the rationale — the front door owns child lifecycle explicitly, and
-//! guessing role from `ps` output is what we're trying to move away
-//! from.
+//! Direct port of Python `_iter_chatbucket_procs()` /
+//! `find_chatbucket_process()` / `_classify_cmdline()`. Handles the same
+//! three cmdline shapes across the SAME logical instance (PID preserved
+//! by os.execv()):
 //!
-//! Cmdline shapes recognized here, in the order the front-door design
-//! shipped them:
+//!   1. `main.py`     -> role "arbitrating" (pre-exec — jitter + health-check)
+//!   2. `server.py` OR `gunicorn ... server:app` -> role "host" (post-exec)
+//!   3. `doorman.py`  -> role "client" (post-exec)
 //!
-//!   1. `main.py`         -> role "host" (front door process itself,
-//!                            when child is up; "arbitrating" when child
-//!                            hasn't come up yet — but we can't tell
-//!                            those apart without the /status endpoint,
-//!                            so we call it Host and let the front-door
-//!                            path override us when it's reachable).
-//!   2. `front_door.py`   -> same as above (some launchers invoke the
-//!                            module directly).
-//!   3. `server.py`       -> role "host" (the child spawned by the
-//!                            front door on 127.0.0.1:5001).
-//!   4. `gunicorn ... server:app` -> role "host" (kept because some
-//!                            deployments still run gunicorn under the
-//!                            supervisor; master/worker discrimination
-//!                            is retained so a stray Stop request via
-//!                            the fallback path signals the master).
-//!   5. `doorman.py`      -> role "client" (LEGACY — retired process.
-//!                            Kept as classification so an OLD checkout
-//!                            still running doorman.py doesn't cause a
-//!                            confusing "no ChatBucket process" report).
-//!
-//! Under normal operation Rust never signals any of these directly —
-//! the front door does. The signalling helpers below (`send_sigterm_*`,
-//! `send_ctrl_break_windows`, `force_kill_pid`) are kept but their only
-//! remaining Manager caller is `kill_stale_arbitrators`, which is a
-//! best-effort cleanup for a pre-front-door leftover process.
+//! Gunicorn master vs worker discrimination: master carries -k/-w/-b/--bind
+//! flags in its argv; workers just show `gunicorn: worker [server:app]` and
+//! must NOT be signalled directly (master respawns them — root cause of the
+//! "did not complete within 8s" symptom in the Python code before it was
+//! fixed).
 
 use crate::repo;
 use std::path::{Path, PathBuf};
@@ -118,33 +96,12 @@ fn classify_cmdline(joined_lower: &str) -> Option<(ProcRole, SubShape)> {
             (ProcRole::Host, SubShape::GunicornWorker)
         });
     }
-    // server.py is the child the front door spawns on :5001. Under the
-    // fallback path we call it Host because that's how the /status
-    // endpoint would report it if it were up.
     if joined_lower.contains("server.py") {
         return Some((ProcRole::Host, SubShape::PythonServer));
     }
-    // front_door.py can appear either as the target of `python main.py`
-    // (which re-execs into front_door.run()) or directly. When we see it
-    // in argv, the front door is the process — but we can't tell from
-    // `ps` whether it's currently hosting or redirecting. Report Host
-    // conservatively; the front-door path will override with routing.
-    if cmdline_matches(joined_lower, "front_door.py") {
-        return Some((ProcRole::Host, SubShape::PythonServer));
-    }
-    // LEGACY: doorman.py was a separate process before the front-door
-    // consolidation. Kept so an old checkout that still runs doorman.py
-    // doesn't silently vanish from the Manager's view; new deployments
-    // don't hit this branch.
     if cmdline_matches(joined_lower, "doorman.py") {
         return Some((ProcRole::Client, SubShape::Doorman));
     }
-    // main.py under the front-door design just invokes front_door.run(),
-    // so "seeing main.py" is equivalent to "seeing the front door". We
-    // still tag it Arbitrating instead of Host in the fallback path
-    // because we truly cannot tell without /status — and the derive
-    // function in manager.rs maps Arbitrating to Starting, which is the
-    // honest "we don't know yet" state.
     if cmdline_matches(joined_lower, "main.py") {
         return Some((ProcRole::Arbitrating, SubShape::Arbitrating));
     }

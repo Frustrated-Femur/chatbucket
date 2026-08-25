@@ -1,38 +1,27 @@
 //! app.rs — egui GUI + worker thread + CLI probe.
 //!
-//! Front-door integration changes vs v0.2 (integration.md §2/§3/§4/§5/§6):
-//!
-//!   * The legacy `sync-state` single-folder probe is gone — every trace
-//!     (`SyncthingState`/`LegacyState`, `render_syncthing_card`,
-//!     `syncthing_color`, the CLI-probe branch) has been removed. All
-//!     Syncthing state now flows through the structured `SyncSnapshot`
-//!     already rendered on the Sync tab.
-//!   * The Network tab holds ONLY the Tailnet Peers card. `Syncthing
-//!     Config` moved to the Sync tab, alongside the folders/devices it
-//!     actually configures.
-//!   * Peers render their IPv4 address alongside online/offline.
-//!   * The Nav rail's Role / Process / Sync rows all read from the SAME
-//!     `StatusSnapshot` the window body reads, via the same
-//!     `derive_role_state()` / `sync_snapshot()`. They cannot silently
-//!     disagree with the window's own cards.
-//!   * "Open ChatBucket" is a single unconditional URL — no
-//!     host-vs-client branching — per §5 (the front door owns the
-//!     redirect on port 5000).
-//!   * The Status tab's second card is renamed "HOST OF RECORD" to
-//!     distance it from the Role card (live truth from the front door)
-//!     — same underlying host-state.json content, but no longer sounds
-//!     like a duplicate of Role.
-//!
-//! Threading model, message channel, and worker loop shape are unchanged.
+//! REDESIGN NOTES (functionality preserved from v0.2):
+//!   * Vertical LEFT navigation rail with icon + label + amber active seam.
+//!   * Custom fonts embedded via include_bytes!:
+//!       - Michroma      → display (wordmark, role badge, eyebrows)
+//!       - IBM Plex Sans → body / buttons
+//!       - IBM Plex Mono → timestamps, PIDs, versions, logs
+//!   * Motion via egui animations: dots pulse when "live", tab active seam
+//!     tweens between rows, buttons ease their fill on hover/press.
+//!   * Same design tokens as before but pushed toward "instrument panel":
+//!     obsidian bg (#050505), hairline borders (#1c1c1c), amber accent (#ffb547).
+//!   * Threading model, message channel, worker loop, and CLI probe are
+//!     unchanged from v0.2 — this file only reworks presentation.
 
 use crate::arbitration::{PeerInfo, PeerList};
 use crate::host_state::HostState;
 use crate::manager::SyncSnapshot;
 use crate::manager::{
-    ActionResult, ClaimedReachability, ConfigSaveResult, ManagerContext, ProcessSource, RoleDetail,
-    RoleState, StatusSnapshot, UpdateCheckResult, UpdateInstallResult,
+    ActionResult, ClaimedReachability, ConfigSaveResult, ManagerContext, RoleDetail, RoleState,
+    StatusSnapshot, UpdateCheckResult, UpdateInstallResult,
 };
 use crate::resources::{self, FolderHealth};
+use crate::syncthing::LegacyState as SyncthingState;
 use crate::syncthing::{ConnectionState, InstallState, ManagerConfig};
 use crate::syncthing::{DeviceAddOutcome, ManagedTransition};
 
@@ -54,15 +43,8 @@ const REFRESH_FAST: Duration = Duration::from_millis(1500);
 const STARTING_MAX_VISIBLE: Duration = Duration::from_secs(45);
 const LOG_CAP: usize = 200;
 
-/// The one place the "Open ChatBucket" URL lives. The front door owns
-/// port 5000 for its entire lifetime and redirects when this machine is
-/// a client — so a single unconditional URL is CORRECT under the new
-/// design (integration.md §5). Any host-vs-client branching would
-/// duplicate logic the front door already applies.
-const CHATBUCKET_OPEN_URL: &str = "http://127.0.0.1:5000/";
-
 // ── Design tokens ─────────────────────────────────────────────────────
-const C_BG: Color32 = Color32::from_rgb(0x05, 0x05, 0x05);
+const C_BG: Color32 = Color32::from_rgb(0x05, 0x05, 0x05); // obsidian
 const C_RAIL: Color32 = Color32::from_rgb(0x08, 0x08, 0x08);
 const C_SURFACE_2: Color32 = Color32::from_rgb(0x0d, 0x0d, 0x0e);
 const C_SURFACE_3: Color32 = Color32::from_rgb(0x15, 0x15, 0x17);
@@ -74,29 +56,33 @@ const C_TEXT: Color32 = Color32::from_rgb(0xf2, 0xf1, 0xed);
 const C_TEXT_2: Color32 = Color32::from_rgb(0xbb, 0xb8, 0xb0);
 const C_TEXT_3: Color32 = Color32::from_rgb(0x82, 0x7f, 0x77);
 const C_TEXT_4: Color32 = Color32::from_rgb(0x55, 0x53, 0x4d);
-const C_SUCCESS: Color32 = Color32::from_rgb(0x6e, 0xe7, 0x8a);
-const C_WARN: Color32 = Color32::from_rgb(0xff, 0xb5, 0x47);
+const C_SUCCESS: Color32 = Color32::from_rgb(0x6e, 0xe7, 0x8a); // phosphor
+const C_WARN: Color32 = Color32::from_rgb(0xff, 0xb5, 0x47); // amber
 const C_DANGER: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
-const C_ACCENT: Color32 = Color32::from_rgb(0xff, 0xb5, 0x47);
+const C_ACCENT: Color32 = Color32::from_rgb(0xff, 0xb5, 0x47); // the signature amber
 
-const F_DISPLAY: &str = "cb_display";
-const F_UI: &str = "cb_ui";
-const F_UI_B: &str = "cb_ui_b";
-const F_MONO: &str = "cb_mono";
+// Font family aliases we register at boot.
+const F_DISPLAY: &str = "cb_display"; // Michroma
+const F_UI: &str = "cb_ui"; // IBM Plex Sans
+const F_UI_B: &str = "cb_ui_b"; // IBM Plex Sans SemiBold
+const F_MONO: &str = "cb_mono"; // IBM Plex Mono
 
-// ── Worker protocol ───────────────────────────────────────────────────
-#[allow(clippy::large_enum_variant)]
+// ── Worker protocol (unchanged) ───────────────────────────────────────
+#[allow(clippy::large_enum_variant)] // Snapshot is the hot path; boxing every
+                                     // message to shave the small variants off would cost an allocation per refresh.
 enum WorkerMsg {
     Snapshot(StatusSnapshot, Instant),
     ActionDone(ActionKind, ActionResult),
     UpdateCheck(UpdateCheckResult),
     UpdateInstall(UpdateInstallResult),
     ConfigSaved(ConfigSaveResult),
-    /// Result of the "Test connection" button — structured
-    /// `ConnectionState`, not the deleted legacy state.
-    ConfigTested(ConnectionState),
+    ConfigTested(SyncthingState),
+    /// Result of a Syncthing control-plane action (reconcile/scan/add/etc).
     SyncDone(String),
+    /// A pending ChatBucket request appeared (event-driven, §17).
     PendingChanged,
+    /// Reserved for worker-emitted log lines (the worker currently logs via
+    /// the snapshot/action results; kept for parity with the protocol).
     #[allow(dead_code)]
     Log(String),
 }
@@ -114,6 +100,7 @@ enum WorkerCmd {
     SaveConfig(ManagerConfig),
     TestSyncthing,
     Shutdown,
+    // Syncthing control plane
     SyncAutoConnect,
     SyncLaunch,
     SyncReconcile,
@@ -158,6 +145,7 @@ impl Tab {
         }
     }
     fn glyph(self) -> &'static str {
+        // Unicode geometric marks — render on any glyph set, no icon font needed.
         match self {
             Tab::Status => "◉",
             Tab::Sync => "⇄",
@@ -168,9 +156,9 @@ impl Tab {
     }
     fn subtitle(self) -> &'static str {
         match self {
-            Tab::Status => "role • process • host of record",
+            Tab::Status => "role • process • claim",
             Tab::Sync => "syncthing • folders • devices",
-            Tab::Network => "tailnet peers",
+            Tab::Network => "tailnet • syncthing",
             Tab::Updates => "release channel",
             Tab::Logs => "live event stream",
         }
@@ -202,6 +190,7 @@ pub struct ManagerApp {
 
     logs: VecDeque<String>,
 
+    // Sync tab UI state
     sync_new_device_id: String,
     sync_status_line: Option<String>,
 
@@ -209,6 +198,7 @@ pub struct ManagerApp {
     msg_rx: Receiver<WorkerMsg>,
     egui_ctx: Arc<Mutex<Option<egui::Context>>>,
 
+    // Boot animation — used for the initial fade-in on the main surface.
     boot_at: Instant,
 }
 
@@ -246,6 +236,8 @@ struct Banner {
 }
 #[derive(Clone, Copy, PartialEq)]
 enum BannerKind {
+    /// Reserved for hard-error banners; current flows surface everything
+    /// user-actionable as Warn. Kept so the match arms stay exhaustive.
     #[allow(dead_code)]
     Error,
     Warn,
@@ -353,14 +345,28 @@ impl ManagerApp {
                         result.action,
                         result.detail
                     ));
-                    match (kind, result.ok) {
-                        (_, false) => self.set_banner(BannerKind::Warn, &result.detail),
-                        (ActionKind::Start, true) => {
+                    match (kind, result.ok, result.action) {
+                        (ActionKind::Start, true, "started_unconfirmed") => {
+                            self.set_banner(BannerKind::Warn, &result.detail)
+                        }
+                        (ActionKind::Start, false, _) => {
+                            self.set_banner(BannerKind::Warn, &result.detail)
+                        }
+                        (ActionKind::Stop, _, "forced") => {
+                            self.set_banner(BannerKind::Warn, &result.detail)
+                        }
+                        (ActionKind::Stop, false, _) => self.set_banner(
+                            BannerKind::Warn,
+                            if result.detail.is_empty() {
+                                "Stop did not complete cleanly."
+                            } else {
+                                &result.detail
+                            },
+                        ),
+                        (ActionKind::Stop, true, "graceful") => {
                             self.set_banner(BannerKind::Info, &result.detail)
                         }
-                        (ActionKind::Stop, true) => {
-                            self.set_banner(BannerKind::Info, &result.detail)
-                        }
+                        _ => {}
                     }
                     let _ = self.cmd_tx.send(WorkerCmd::Refresh);
                     self.busy.refresh = true;
@@ -413,11 +419,11 @@ impl ManagerApp {
                 }
                 WorkerMsg::ConfigTested(state) => {
                     self.busy.test_syncthing = false;
-                    self.push_log(&format!("syncthing test → {}", state.label()));
+                    self.push_log(&format!("syncthing test → {}", state.short_label()));
                     self.cfg_status_line = Some(format!(
                         "Test result: {} — {}",
-                        state.label(),
-                        conn_state_detail(&state)
+                        state.short_label(),
+                        state.detail()
                     ));
                     let _ = self.cmd_tx.send(WorkerCmd::Refresh);
                     self.busy.refresh = true;
@@ -462,16 +468,14 @@ impl eframe::App for ManagerApp {
         *self.egui_ctx.lock().unwrap() = Some(ctx.clone());
         self.drain_messages();
 
-        let fast = self
+        let repaint_after = match self
             .snapshot
             .as_ref()
-            .map(|s| matches!(s.role.state, RoleState::Starting))
-            .unwrap_or(false)
-            || self.busy.any_lifecycle();
-        let repaint_after = if fast {
-            Duration::from_millis(250)
-        } else {
-            Duration::from_millis(500)
+            .map(|s| s.role.state.clone())
+            .unwrap_or(RoleState::Idle)
+        {
+            RoleState::Starting => Duration::from_millis(120),
+            _ => Duration::from_millis(400),
         };
         ctx.request_repaint_after(repaint_after);
 
@@ -494,6 +498,7 @@ impl eframe::App for ManagerApp {
                     .inner_margin(egui::Margin::same(0.0)),
             )
             .show(ctx, |ui| {
+                // Boot fade-in on the main surface (staggered reveal).
                 let elapsed = self.boot_at.elapsed().as_secs_f32();
                 let boot_alpha = (elapsed * 2.2).clamp(0.0, 1.0);
                 ctx.request_repaint_after(Duration::from_millis(16));
@@ -503,6 +508,7 @@ impl eframe::App for ManagerApp {
                     self.render_banner(ui);
                     ui.add_space(6.0);
 
+                    // Alpha-fade the tab body
                     let fade = egui::Frame::none()
                         .fill(Color32::from_rgba_unmultiplied(
                             0,
@@ -524,6 +530,7 @@ impl eframe::App for ManagerApp {
                                     Tab::Updates => self.render_updates_tab(ui),
                                     Tab::Logs => self.render_logs_tab(ui),
                                 });
+                            // Overlay the boot veil.
                             let rect = ui.max_rect();
                             fade.show(ui, |ui| {
                                 ui.allocate_rect(rect, egui::Sense::hover());
@@ -539,6 +546,7 @@ impl ManagerApp {
     fn render_rail(&mut self, ui: &mut egui::Ui) {
         // Wordmark
         ui.horizontal(|ui| {
+            // Amber square dot as a logomark
             let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, egui::Rounding::same(1.5), C_ACCENT);
@@ -552,7 +560,7 @@ impl ManagerApp {
         });
         ui.add_space(2.0);
         ui.label(
-            RichText::new("manager · v0.3 (front-door)")
+            RichText::new("manager · v0.2")
                 .family(FontFamily::Name(F_MONO.into()))
                 .color(C_TEXT_4)
                 .size(10.0),
@@ -564,90 +572,100 @@ impl ManagerApp {
         ui.label(
             RichText::new("NAVIGATE")
                 .family(FontFamily::Name(F_DISPLAY.into()))
-                .color(C_TEXT_4)
+                .color(C_TEXT_3)
                 .size(9.0),
         );
-        ui.add_space(6.0);
+        ui.add_space(10.0);
 
+        // Nav items
         for tab in Tab::ALL {
             self.render_rail_item(ui, tab);
+            ui.add_space(4.0);
         }
 
-        ui.add_space(18.0);
-        thin_divider(ui);
-        ui.add_space(14.0);
+        ui.add_space(24.0);
 
-        // ── Live status rows ───────────────────────────────────────
-        // All three rows read from the SAME `StatusSnapshot` the main
-        // window renders — no independent derivations. If a value here
-        // differs from the Role/Process/Sync cards, that's a real bug
-        // in `derive_role_state()` / `sync_snapshot()`, not two paths
-        // disagreeing (integration.md §6).
+        // ── Live status compact block ─────────────────────────────────
         ui.label(
             RichText::new("LIVE")
                 .family(FontFamily::Name(F_DISPLAY.into()))
-                .color(C_TEXT_4)
+                .color(C_TEXT_3)
                 .size(9.0),
         );
-        ui.add_space(6.0);
-
-        // Role row — front-door authoritative when reachable.
-        let (role_label, role_color) = match self.snapshot.as_ref() {
-            Some(s) => (s.role.state.label().to_string(), role_color(&s.role.state)),
-            None => ("—".into(), C_TEXT_3),
-        };
-        let live = self
-            .snapshot
-            .as_ref()
-            .map(|s| {
-                matches!(
-                    s.role.state,
-                    RoleState::Host | RoleState::Client | RoleState::Redirect | RoleState::Starting
-                )
-            })
-            .unwrap_or(false);
-        rail_status_row(ui, "role", &role_label, role_color, live);
-
-        // Process row — same source as the Process card. Says
-        // "front door" or "os scan" so the user knows which path
-        // produced the pid (integration.md §6 explanatory note).
-        let (proc_label, proc_color, proc_live) = match self.snapshot.as_ref() {
-            None => ("—".to_string(), C_TEXT_3, false),
-            Some(s) => match &s.process {
-                Some(p) => (
-                    match p.source {
-                        ProcessSource::FrontDoor => format!("pid {} · fd", p.pid),
-                        ProcessSource::ProcessScan => format!("pid {} · scan", p.pid),
-                    },
-                    C_SUCCESS,
-                    true,
-                ),
-                None => ("stopped".into(), C_TEXT_3, false),
-            },
-        };
-        rail_status_row(ui, "process", &proc_label, proc_color, proc_live);
-
-        // Sync row — `SyncSnapshot::aggregate_health()` is the SAME
-        // aggregate the Sync tab shows in its header. Disabled folders
-        // are excluded from the denominator; the worst-health colour
-        // wins.
-        let (sync_label, sync_color, sync_live) = match self.snapshot.as_ref() {
-            None => ("—".to_string(), C_TEXT_3, false),
-            Some(s) => {
-                if !s.sync.connection.is_connected() {
-                    (s.sync.connection.label().to_string(), C_WARN, false)
-                } else {
-                    let agg = s.sync.aggregate_health();
-                    let (col, _) = health_visual(&agg.worst);
-                    (
-                        format!("{}/{}", agg.healthy, agg.total),
-                        col,
-                        matches!(agg.worst, FolderHealth::Syncing { .. } | FolderHealth::InSync),
+        ui.add_space(8.0);
+        rail_live_row(
+            ui,
+            "role",
+            self.snapshot
+                .as_ref()
+                .map(|s| s.role.state.label())
+                .unwrap_or("—"),
+            self.snapshot
+                .as_ref()
+                .map(|s| role_color(&s.role.state))
+                .unwrap_or(C_TEXT_3),
+            self.snapshot
+                .as_ref()
+                .map(|s| {
+                    matches!(
+                        s.role.state,
+                        RoleState::Host | RoleState::Client | RoleState::Starting
                     )
-                }
-            }
-        };
-        rail_status_row(ui, "sync", &sync_label, sync_color, sync_live);
+                })
+                .unwrap_or(false),
+        );
+        ui.add_space(6.0);
+        rail_live_row(
+            ui,
+            "process",
+            self.snapshot
+                .as_ref()
+                .map(|s| {
+                    if s.process.is_some() {
+                        "running"
+                    } else {
+                        "stopped"
+                    }
+                })
+                .unwrap_or("—"),
+            self.snapshot
+                .as_ref()
+                .map(|s| {
+                    if s.process.is_some() {
+                        C_SUCCESS
+                    } else {
+                        C_TEXT_3
+                    }
+                })
+                .unwrap_or(C_TEXT_3),
+            self.snapshot
+                .as_ref()
+                .map(|s| s.process.is_some())
+                .unwrap_or(false),
+        );
+        ui.add_space(6.0);
+        rail_live_row(
+            ui,
+            "sync",
+            self.snapshot
+                .as_ref()
+                .map(|s| s.syncthing.short_label())
+                .unwrap_or_else(|| "—".into())
+                .as_str(),
+            self.snapshot
+                .as_ref()
+                .map(|s| syncthing_color(&s.syncthing))
+                .unwrap_or(C_TEXT_3),
+            self.snapshot
+                .as_ref()
+                .map(|s| {
+                    matches!(
+                        s.syncthing,
+                        SyncthingState::InSync | SyncthingState::Syncing
+                    )
+                })
+                .unwrap_or(false),
+        );
 
         // Push footer to bottom
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -682,9 +700,10 @@ impl ManagerApp {
         ui.painter()
             .rect_filled(rect, egui::Rounding::same(10.0), fill);
 
+        // Left amber seam — grows on active/hover
         let seam_h = 20.0 + 18.0 * anim;
         let seam_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.min.x, rect.center().y - seam_h / 2.0),
+            egui::pos2(rect.min.x + 0.0, rect.center().y - seam_h / 2.0),
             egui::vec2(3.0, seam_h),
         );
         let seam_col = if selected {
@@ -700,6 +719,7 @@ impl ManagerApp {
         ui.painter()
             .rect_filled(seam_rect, egui::Rounding::same(2.0), seam_col);
 
+        // Glyph
         let glyph_col = lerp_color(C_TEXT_3, C_TEXT, anim);
         ui.painter().text(
             egui::pos2(rect.min.x + 20.0, rect.center().y),
@@ -709,6 +729,7 @@ impl ManagerApp {
             glyph_col,
         );
 
+        // Label + subtitle
         let label_col = lerp_color(C_TEXT_2, C_TEXT, anim);
         ui.painter().text(
             egui::pos2(rect.min.x + 44.0, rect.center().y - 8.0),
@@ -730,7 +751,7 @@ impl ManagerApp {
         }
     }
 
-    // ── TOP STRIP ─────────────────────────────────────────────────────
+    // ── TOP STRIP (right of rail) ─────────────────────────────────────
     fn render_top_strip(&mut self, ui: &mut egui::Ui) {
         let frame = egui::Frame::none()
             .fill(C_BG)
@@ -743,6 +764,7 @@ impl ManagerApp {
             });
         frame.show(ui, |ui| {
             ui.horizontal(|ui| {
+                // Big display title of the current section
                 ui.vertical(|ui| {
                     ui.label(
                         RichText::new(self.tab.label().to_uppercase())
@@ -758,6 +780,7 @@ impl ManagerApp {
                     );
                 });
 
+                // Right-side: refresh + updated-ago pill
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let refresh_label = if self.busy.refresh {
                         "REFRESHING…"
@@ -768,14 +791,6 @@ impl ManagerApp {
                         self.busy.refresh = true;
                         self.push_log("manual refresh");
                         let _ = self.cmd_tx.send(WorkerCmd::Refresh);
-                    }
-                    ui.add_space(8.0);
-                    // Single unconditional Open URL — integration.md §5.
-                    // The front door owns port 5000; a client's front
-                    // door serves a redirect on the same URL, so we
-                    // MUST NOT branch on host-vs-client here.
-                    if pill_button(ui, "OPEN CHATBUCKET  ↗", true, false).clicked() {
-                        let _ = open::that_detached(CHATBUCKET_OPEN_URL);
                     }
                     ui.add_space(10.0);
                     if let Some(t) = self.last_updated {
@@ -858,7 +873,7 @@ impl ManagerApp {
             });
     }
 
-    // ── STATUS TAB ────────────────────────────────────────────────────
+    // ── TABS ──────────────────────────────────────────────────────────
     fn render_status_tab(&mut self, ui: &mut egui::Ui) {
         self.render_role_card(ui);
         ui.add_space(12.0);
@@ -868,7 +883,7 @@ impl ManagerApp {
         if total < 620.0 {
             self.render_process_card(ui);
             ui.add_space(gap);
-            self.render_host_of_record_card(ui);
+            self.render_claimed_card(ui);
         } else {
             let col_w = (total - gap) / 2.0;
             ui.horizontal_top(|ui| {
@@ -886,22 +901,50 @@ impl ManagerApp {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_max_width(col_w);
-                        self.render_host_of_record_card(ui);
+                        self.render_claimed_card(ui);
                     },
                 );
             });
         }
     }
 
-    // ── NETWORK TAB — TAILNET PEERS ONLY (integration.md §2) ──────────
     fn render_network_tab(&mut self, ui: &mut egui::Ui) {
         self.render_peers_card(ui);
+        ui.add_space(12.0);
+
+        let total = ui.available_width();
+        let gap = 12.0;
+        if total < 620.0 {
+            self.render_syncthing_card(ui);
+            ui.add_space(gap);
+            self.render_syncthing_config_card(ui);
+        } else {
+            let col_w = (total - gap) / 2.0;
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(col_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(col_w);
+                        self.render_syncthing_card(ui);
+                    },
+                );
+                ui.add_space(gap);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(col_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(col_w);
+                        self.render_syncthing_config_card(ui);
+                    },
+                );
+            });
+        }
     }
 
-    // ── SYNC TAB ──────────────────────────────────────────────────────
-    // Adds the Syncthing Config card (moved from Network) alongside the
-    // folders/devices it configures — integration.md §2.
+    // ── SYNC TAB (ChatBucket control plane for Syncthing) ─────────────
     fn render_sync_tab(&mut self, ui: &mut egui::Ui) {
+        // Clone the snapshot pieces we render so we can mutate self freely.
         let sync: SyncSnapshot = match &self.snapshot {
             Some(s) => s.sync.clone(),
             None => SyncSnapshot::default(),
@@ -910,10 +953,7 @@ impl ManagerApp {
         self.render_sync_connection_card(ui, &sync);
         ui.add_space(12.0);
 
-        // Syncthing REST config lives here now (moved from Network).
-        self.render_syncthing_config_card(ui);
-        ui.add_space(12.0);
-
+        // Pending requests (event-driven) — shown prominently when present.
         if let Some(pending) = &sync.pending {
             if !pending.chatbucket_requests.is_empty() {
                 self.render_pending_requests(ui, pending);
@@ -921,9 +961,34 @@ impl ManagerApp {
             }
         }
 
-        self.render_folders_card(ui, &sync);
-        ui.add_space(12.0);
-        self.render_devices_card(ui, &sync);
+        let total = ui.available_width();
+        let gap = 12.0;
+        if total < 640.0 {
+            self.render_folders_card(ui, &sync);
+            ui.add_space(gap);
+            self.render_devices_card(ui, &sync);
+        } else {
+            let col_w = (total - gap) / 2.0;
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(col_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(col_w);
+                        self.render_folders_card(ui, &sync);
+                    },
+                );
+                ui.add_space(gap);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(col_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(col_w);
+                        self.render_devices_card(ui, &sync);
+                    },
+                );
+            });
+        }
     }
 
     fn render_sync_connection_card(&mut self, ui: &mut egui::Ui, sync: &SyncSnapshot) {
@@ -932,6 +997,7 @@ impl ManagerApp {
             "SYNCTHING",
             "ChatBucket synchronization control plane.",
             |ui| {
+                // Status chips
                 ui.horizontal_wrapped(|ui| {
                     status_chip(
                         ui,
@@ -959,6 +1025,7 @@ impl ManagerApp {
                 });
                 ui.add_space(8.0);
 
+                // State-specific guidance (§2/§11): never a generic "API error".
                 match sync.install {
                     InstallState::NotInstalled => {
                         ui.label(
@@ -991,7 +1058,7 @@ impl ManagerApp {
                                     .color(C_TEXT_2).size(11.5));
                                 }
                                 ConnectionState::AuthFailed => {
-                                    ui.label(RichText::new("Syncthing rejected the API key. Re-run auto-connect, or paste a fresh key below.")
+                                    ui.label(RichText::new("Syncthing rejected the API key. Re-run auto-connect, or paste a fresh key on the Network tab.")
                                     .color(C_DANGER).size(11.5));
                                 }
                                 ConnectionState::Unreachable(_) => {
@@ -1125,200 +1192,155 @@ impl ManagerApp {
                     );
                     return;
                 }
-                for (i, f) in sync.folders.iter().enumerate() {
-                    let (col, glyph) = health_visual(&f.health);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(glyph)
-                                .family(FontFamily::Name(F_UI_B.into()))
-                                .color(col)
-                                .size(12.5),
-                        );
-                        ui.label(
-                            RichText::new(f.label)
-                                .family(FontFamily::Name(F_UI_B.into()))
-                                .color(C_TEXT)
-                                .size(12.5),
-                        );
-                        let need_txt = match &f.health {
-                            FolderHealth::Syncing {
-                                need_files,
-                                need_bytes,
-                            } => format!(" · {} files · {}", need_files, format_bytes(*need_bytes)),
-                            _ => String::new(),
-                        };
-                        ui.label(
-                            RichText::new(need_txt)
-                                .family(FontFamily::Name(F_MONO.into()))
-                                .color(C_TEXT_3)
-                                .size(10.5),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let m = f.managed;
-                            let label = if m { "MANAGED" } else { "DISABLED" };
-                            if mini_button(ui, if m { "DISABLE" } else { "ENABLE" }, !self.busy.sync)
-                            {
-                                self.busy.sync = true;
-                                let _ = self
-                                    .cmd_tx
-                                    .send(WorkerCmd::SyncSetManaged(f.folder_id.clone(), !m));
-                            }
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(label)
-                                    .family(FontFamily::Name(F_UI.into()))
-                                    .color(if m { C_TEXT_2 } else { C_TEXT_4 })
-                                    .size(10.5),
-                            );
-                        });
-                    });
-                    ui.add_space(3.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("id · {}", f.folder_id))
-                                .family(FontFamily::Name(F_MONO.into()))
-                                .color(C_TEXT_4)
-                                .size(10.5),
-                        );
-                        if !f.last_scan.is_empty() {
-                            ui.label(
-                                RichText::new(format!("last scan · {}", short_time(&f.last_scan)))
-                                    .family(FontFamily::Name(F_MONO.into()))
-                                    .color(C_TEXT_4)
-                                    .size(10.5),
-                            );
-                        }
-                        if f.has_conflict {
-                            ui.label(
-                                RichText::new("SYNC-CONFLICT")
-                                    .family(FontFamily::Name(F_UI_B.into()))
-                                    .color(C_DANGER)
-                                    .size(10.5),
-                            );
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if mini_button(ui, "RESCAN", !self.busy.sync && f.managed) {
-                                self.busy.sync = true;
-                                let _ = self.cmd_tx.send(WorkerCmd::SyncScan(f.folder_id.clone()));
-                            }
-                            ui.add_space(4.0);
-                            if mini_button(ui, "PAUSE", !self.busy.sync && f.managed) {
-                                self.busy.sync = true;
-                                let _ = self.cmd_tx.send(WorkerCmd::SyncPause(f.folder_id.clone()));
-                            }
-                            ui.add_space(4.0);
-                            if mini_button(ui, "RESUME", !self.busy.sync && f.managed) {
-                                self.busy.sync = true;
-                                let _ =
-                                    self.cmd_tx.send(WorkerCmd::SyncResume(f.folder_id.clone()));
-                            }
-                        });
-                    });
-                    if i + 1 < sync.folders.len() {
-                        ui.add_space(6.0);
-                        thin_divider(ui);
-                        ui.add_space(6.0);
-                    }
+                let folders = sync.folders.clone();
+                for f in &folders {
+                    self.render_folder_row(ui, f, sync.connection.is_connected());
+                    ui.add_space(4.0);
                 }
             },
         );
     }
 
-    fn render_devices_card(&mut self, ui: &mut egui::Ui, sync: &SyncSnapshot) {
-        card(
-            ui,
-            "DEVICES",
-            "Remote peers configured for ChatBucket folders. Your own machine is filtered out — that's Syncthing's design, not a bug.",
-            |ui| {
+    fn render_folder_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        f: &crate::manager::FolderView,
+        connected: bool,
+    ) {
+        let (dot, color) = health_visual(&f.health);
+        egui::Frame::none()
+            .fill(C_SURFACE_3)
+            .stroke(Stroke::new(1.0_f32, C_BORDER_1))
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let button_w = 60.0; // reserve space so ADD isn't squeezed out
-                    let edit = egui::TextEdit::singleline(&mut self.sync_new_device_id)
-                        .hint_text("paste remote device ID (with dashes)")
-                        .font(egui::FontId::new(11.5, FontFamily::Name(F_MONO.into())))
-                        .desired_width(ui.available_width() - button_w - ui.spacing().item_spacing.x);
-                    let resp = ui.add(edit);
-
-                    let enter_pressed =
-                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let clicked = pill_button(
-                        ui,
-                        "ADD",
-                        !self.busy.sync && !self.sync_new_device_id.trim().is_empty(),
-                        false,
-                    )
-                    .clicked();
-
-                    if (enter_pressed || clicked) && !self.sync_new_device_id.trim().is_empty() {
-                        self.busy.sync = true;
-                        let id = self.sync_new_device_id.trim().to_string();
-                        self.sync_new_device_id.clear();
-                        let _ = self.cmd_tx.send(WorkerCmd::SyncAddDevice(id));
-                    }
-                });
-                ui.add_space(8.0);
-
-                if sync.devices.is_empty() {
+                    ui.label(RichText::new(dot).color(color).size(12.0));
                     ui.label(
-                        RichText::new("No remote devices configured yet.")
-                            .color(C_TEXT_3)
-                            .size(11.5),
+                        RichText::new(f.label)
+                            .family(FontFamily::Name(F_UI_B.into()))
+                            .color(C_TEXT)
+                            .size(12.5),
                     );
-                    return;
-                }
-                for (i, d) in sync.devices.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let col = if d.connected { C_SUCCESS } else { C_TEXT_3 };
-                        pulse_dot(ui, col, d.connected, 8.0);
-                        ui.add_space(6.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // managed toggle (§16.5)
+                        let mut m = f.managed;
+                        if ui
+                            .add_enabled(!self.busy.sync, egui::Checkbox::new(&mut m, ""))
+                            .changed()
+                        {
+                            self.busy.sync = true;
+                            let _ = self
+                                .cmd_tx
+                                .send(WorkerCmd::SyncSetManaged(f.folder_id.clone(), m));
+                        }
+                        ui.label(RichText::new(f.health.label()).color(color).size(11.0));
+                    });
+                });
+                // Detail line
+                if f.managed && connected {
+                    let mut parts: Vec<String> = Vec::new();
+                    if f.need_files > 0 {
+                        parts.push(format!("{} file(s) left", f.need_files));
+                    }
+                    if f.need_bytes > 0 {
+                        parts.push(format_bytes(f.need_bytes));
+                    }
+                    if f.error_count > 0 {
+                        parts.push(format!("{} error(s)", f.error_count));
+                    }
+                    if !f.last_scan.is_empty() {
+                        parts.push(format!("scan {}", short_time(&f.last_scan)));
+                    }
+                    if !parts.is_empty() {
                         ui.label(
-                            RichText::new(&d.name)
-                                .family(FontFamily::Name(F_UI_B.into()))
-                                .color(C_TEXT)
-                                .size(12.0),
-                        );
-                        ui.label(
-                            RichText::new(&d.device_id)
+                            RichText::new(parts.join(" · "))
                                 .family(FontFamily::Name(F_MONO.into()))
-                                .color(C_TEXT_4)
+                                .color(C_TEXT_3)
                                 .size(10.5),
                         );
-                        if !d.fully_associated {
-                            ui.label(
-                                RichText::new("PARTIAL")
-                                    .family(FontFamily::Name(F_UI_B.into()))
-                                    .color(C_WARN)
-                                    .size(10.5),
-                            );
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if mini_button(ui, "REMOVE", !self.busy.sync) {
-                                self.busy.sync = true;
-                                let id = d.device_id.clone();
-                                let _ =
-                                    self.cmd_tx.send(WorkerCmd::SyncRemoveDevice(id.clone()));
-                            }
-                        });
-                    });
-                    if i + 1 < sync.devices.len() {
-                        ui.add_space(4.0);
-                        thin_divider(ui);
-                        ui.add_space(4.0);
                     }
+                    ui.horizontal(|ui| {
+                        if mini_button(ui, "Rescan", !self.busy.sync) {
+                            self.busy.sync = true;
+                            let _ = self.cmd_tx.send(WorkerCmd::SyncScan(f.folder_id.clone()));
+                        }
+                        if mini_button(ui, "Pause", !self.busy.sync) {
+                            self.busy.sync = true;
+                            let _ = self.cmd_tx.send(WorkerCmd::SyncPause(f.folder_id.clone()));
+                        }
+                        if mini_button(ui, "Resume", !self.busy.sync) {
+                            self.busy.sync = true;
+                            let _ = self.cmd_tx.send(WorkerCmd::SyncResume(f.folder_id.clone()));
+                        }
+                    });
                 }
-                ui.add_space(10.0);
-                if pill_button(
-                    ui,
-                    "CLEAR SYNC ERRORS",
-                    !self.busy.sync && sync.connection.is_connected(),
-                    true,
-                )
-                .clicked()
-                {
+            });
+    }
+
+    fn render_devices_card(&mut self, ui: &mut egui::Ui, sync: &SyncSnapshot) {
+        card(ui, "DEVICES", "Remote machines sharing ChatBucket data. Add by Syncthing device ID — Manager associates all managed folders.", |ui| {
+            // Add-device flow (§16/§21)
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.sync_new_device_id)
+                    .hint_text("Device ID")
+                    .desired_width(280.0));
+                if pill_button(ui, "ADD", !self.busy.sync && !self.sync_new_device_id.trim().is_empty(), false).clicked() {
+                    let id = self.sync_new_device_id.clone();
                     self.busy.sync = true;
-                    let _ = self.cmd_tx.send(WorkerCmd::SyncClearErrors);
+                    let _ = self.cmd_tx.send(WorkerCmd::SyncAddDevice(id));
+                    self.sync_new_device_id.clear();
                 }
-            },
-        );
+            });
+            ui.add_space(8.0);
+
+            if sync.devices.is_empty() {
+                ui.label(RichText::new("No devices sharing ChatBucket data yet.").color(C_TEXT_3).size(11.5));
+            } else {
+                for d in &sync.devices {
+                    let id = d.device_id.clone();
+                    egui::Frame::none()
+                        .fill(C_SURFACE_3)
+                        .stroke(Stroke::new(1.0_f32, C_BORDER_1))
+                        .rounding(egui::Rounding::same(10.0))
+                        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let dot = if d.connected { "●" } else { "○" };
+                                let c = if d.connected { C_SUCCESS } else { C_TEXT_4 };
+                                ui.label(RichText::new(dot).color(c).size(12.0));
+                                ui.label(RichText::new(&d.name).family(FontFamily::Name(F_MONO.into()))
+                                    .color(C_TEXT).size(12.0));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if mini_button(ui, "Remove", !self.busy.sync) {
+                                        self.busy.sync = true;
+                                        let _ = self.cmd_tx.send(WorkerCmd::SyncRemoveDevice(id.clone()));
+                                    }
+                                    if !d.fully_associated {
+                                        ui.label(RichText::new("partial").color(C_WARN).size(10.5));
+                                    }
+                                    ui.label(RichText::new(if d.connected {"connected"} else {"offline"})
+                                        .color(c).size(11.0));
+                                });
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+            }
+
+            // State-conflict warning (§15)
+            if sync.state_conflict_count > 0 {
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!("⚠ {} arbitration conflict file(s) detected under state/ — review before restarting.", sync.state_conflict_count))
+                    .color(C_WARN).size(11.0));
+            }
+
+            ui.add_space(4.0);
+            if pill_button(ui, "CLEAR SYNC ERRORS", !self.busy.sync && sync.connection.is_connected(), true).clicked() {
+                self.busy.sync = true;
+                let _ = self.cmd_tx.send(WorkerCmd::SyncClearErrors);
+            }
+        });
     }
 
     fn render_updates_tab(&mut self, ui: &mut egui::Ui) {
@@ -1326,57 +1348,63 @@ impl ManagerApp {
     }
 
     fn render_logs_tab(&mut self, ui: &mut egui::Ui) {
-        card(ui, "EVENT LOG", "Everything the manager did, most recent first.", |ui| {
-            ui.horizontal(|ui| {
-                if pill_button(ui, "COPY", !self.logs.is_empty(), false).clicked() {
-                    let mut s = String::new();
-                    for line in self.logs.iter() {
-                        s.push_str(line);
-                        s.push('\n');
+        card(
+            ui,
+            "EVENT LOG",
+            "Every user action, worker refresh, and state transition, newest first.",
+            |ui| {
+                ui.horizontal(|ui| {
+                    if pill_button(ui, "COPY", !self.logs.is_empty(), false).clicked() {
+                        let joined = self
+                            .logs
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ui.output_mut(|o| o.copied_text = joined);
+                        self.push_log("copied log to clipboard");
                     }
-                    ui.output_mut(|o| o.copied_text = s);
-                }
-                ui.add_space(6.0);
-                if pill_button(ui, "CLEAR", !self.logs.is_empty(), true).clicked() {
-                    self.logs.clear();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{} lines · cap {}", self.logs.len(), LOG_CAP))
-                            .family(FontFamily::Name(F_MONO.into()))
-                            .color(C_TEXT_4)
-                            .size(11.0),
-                    );
+                    if pill_button(ui, "CLEAR", !self.logs.is_empty(), true).clicked() {
+                        self.logs.clear();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{} lines · cap {}", self.logs.len(), LOG_CAP))
+                                .family(FontFamily::Name(F_MONO.into()))
+                                .color(C_TEXT_4)
+                                .size(11.0),
+                        );
+                    });
                 });
-            });
-            ui.add_space(10.0);
-            let mut text = String::new();
-            for line in self.logs.iter().rev() {
-                text.push_str(line);
-                text.push('\n');
-            }
-            egui::Frame::none()
-                .fill(C_SURFACE_3)
-                .stroke(Stroke::new(1.0_f32, C_BORDER_1))
-                .rounding(egui::Rounding::same(10.0))
-                .inner_margin(egui::Margin::symmetric(14.0, 12.0))
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(440.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(text)
-                                        .family(FontFamily::Name(F_MONO.into()))
-                                        .color(C_TEXT_2)
-                                        .size(11.5),
-                                )
-                                .wrap(true),
-                            );
-                        });
-                });
-        });
+                ui.add_space(10.0);
+                let mut text = String::new();
+                for line in self.logs.iter().rev() {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                egui::Frame::none()
+                    .fill(C_SURFACE_3)
+                    .stroke(Stroke::new(1.0_f32, C_BORDER_1))
+                    .rounding(egui::Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(440.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text)
+                                            .family(FontFamily::Name(F_MONO.into()))
+                                            .color(C_TEXT_2)
+                                            .size(11.5),
+                                    )
+                                    .wrap(true),
+                                );
+                            });
+                    });
+            },
+        );
     }
 
     // ── CARDS ─────────────────────────────────────────────────────────
@@ -1384,17 +1412,14 @@ impl ManagerApp {
         card(
             ui,
             "ROLE",
-            "What this ChatBucket instance is currently doing on the tailnet (front-door authoritative when reachable).",
+            "What this ChatBucket instance is currently doing on the tailnet.",
             |ui| {
                 let (label, detail, color, live) =
                     match self.snapshot.as_ref().map(|s| s.role.clone()) {
                         Some(r) => {
                             let live = matches!(
                                 r.state,
-                                RoleState::Host
-                                    | RoleState::Client
-                                    | RoleState::Redirect
-                                    | RoleState::Starting
+                                RoleState::Host | RoleState::Client | RoleState::Starting
                             );
                             (
                                 r.state.label().to_string(),
@@ -1424,31 +1449,17 @@ impl ManagerApp {
                         .size(12.5),
                 );
 
-                // Explainer strip: front-door-reachability note
-                if let Some(snap) = &self.snapshot {
-                    if snap.front_door.is_none() {
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(
-                                "Front door (127.0.0.1:5050) is not responding — falling back to OS process scan for this reading.",
-                            )
-                            .family(FontFamily::Name(F_UI.into()))
-                            .color(C_WARN)
-                            .size(11.0),
-                        );
-                    }
-                }
-
+                // Explainer strip so users aren't confused by the badge terms.
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    legend_pill(ui, "HOST", C_SUCCESS, "hosting locally");
-                    legend_pill(ui, "CLIENT", C_TEXT, "redirecting to a peer");
-                    legend_pill(ui, "STARTING", C_TEXT_2, "arbitrating / transitioning");
-                    legend_pill(ui, "STALE", C_WARN, "self claim, no host");
-                    legend_pill(ui, "UNAVAILABLE", C_WARN, "no host known");
-                    legend_pill(ui, "IDLE", C_TEXT_3, "never hosted");
+                    legend_pill(ui, "HOST", C_SUCCESS, "hosts on this machine");
+                    legend_pill(ui, "CLIENT", C_TEXT, "connected to a peer host");
+                    legend_pill(ui, "STARTING", C_TEXT_2, "arbitrating (≤45 s)");
+                    legend_pill(ui, "STALE", C_WARN, "claim > 45 s old");
+                    legend_pill(ui, "CONFLICT", C_DANGER, "two hosts claim it");
+                    legend_pill(ui, "IDLE", C_TEXT_3, "no process running");
                 });
             },
         );
@@ -1458,7 +1469,7 @@ impl ManagerApp {
         card(
             ui,
             "PROCESS",
-            "Front-door child (server.py). Signalled via 127.0.0.1:5050/control — never by the Manager directly under the front-door design.",
+            "Lifecycle of the ChatBucket server / doorman process group.",
             |ui| {
                 let running = self.snapshot.as_ref().and_then(|s| s.process.clone());
                 match &running {
@@ -1476,11 +1487,6 @@ impl ManagerApp {
                         ui.add_space(6.0);
                         kv_row(ui, "pid", &format!("{}", p.pid));
                         kv_row(ui, "role", p.role.as_str());
-                        let src = match p.source {
-                            ProcessSource::FrontDoor => "front door /status",
-                            ProcessSource::ProcessScan => "os process scan (fallback)",
-                        };
-                        kv_row(ui, "source", src);
                     }
                     None => {
                         ui.horizontal(|ui| {
@@ -1527,13 +1533,13 @@ impl ManagerApp {
                     if pill_button(ui, start_label, can_start, false).clicked() {
                         self.clear_banner();
                         self.busy.start = true;
-                        self.push_log("start requested (→ front door)");
+                        self.push_log("start requested");
                         let _ = self.cmd_tx.send(WorkerCmd::Start);
                     }
                     if pill_button(ui, stop_label, can_stop, true).clicked() {
                         self.clear_banner();
                         self.busy.stop = true;
-                        self.push_log("stop requested (→ front door)");
+                        self.push_log("stop requested");
                         let _ = self.cmd_tx.send(WorkerCmd::Stop);
                     }
                 });
@@ -1541,7 +1547,8 @@ impl ManagerApp {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(
-                        "START/STOP post to the front-door control endpoint. If the front door is not up, they surface that directly rather than trying to spawn the process ourselves — the front door owns lifecycle.",
+                        "START blocks briefly until arbitration resolves. STOP signals the whole \
+                 process group and waits for graceful exit before force-killing.",
                     )
                     .family(FontFamily::Name(F_UI.into()))
                     .color(C_TEXT_4)
@@ -1551,13 +1558,8 @@ impl ManagerApp {
         );
     }
 
-    /// Formerly "CLAIMED HOST". Renamed to distinguish it from the live
-    /// Role card — this one is purely file-level: who is in
-    /// host-state.json and is that machine reachable. Role is live
-    /// truth from the front door. Same underlying data, different
-    /// question. (Integration.md §4.3.)
-    fn render_host_of_record_card(&self, ui: &mut egui::Ui) {
-        card(ui, "HOST OF RECORD", "The machine currently written into host-state.json. This is the DECLARED host, distinct from live routing (see Role above).", |ui| {
+    fn render_claimed_card(&self, ui: &mut egui::Ui) {
+        card(ui, "CLAIMED HOST", "The machine currently claiming host-of-record in host-state.json, and whether it's reachable.", |ui| {
             let Some(snap) = &self.snapshot else {
                 dot_line(ui, C_TEXT_3, "—", "loading…", false);
                 return;
@@ -1580,7 +1582,7 @@ impl ManagerApp {
     }
 
     fn render_peers_card(&self, ui: &mut egui::Ui) {
-        card(ui, "TAILNET PEERS", "Every real device on this tailnet, with the IPv4 tailscale assigned. Tailscale infrastructure without a DNSName is counted but hidden.", |ui| {
+        card(ui, "TAILNET PEERS", "Every real device on this tailnet. Tailscale infrastructure without a DNSName is counted but hidden.", |ui| {
             let Some(snap) = &self.snapshot else {
                 dot_line(ui, C_TEXT_3, "—", "loading…", false); return;
             };
@@ -1594,12 +1596,7 @@ impl ManagerApp {
                         sorted.sort_by(|a, b| a.name.cmp(&b.name));
                         for (i, p) in sorted.iter().enumerate() {
                             let (col, state) = if p.online { (C_SUCCESS, "online") } else { (C_TEXT_3, "offline") };
-                            // IPv4 rendered next to the name — content-based
-                            // extraction in arbitration.rs means this is the
-                            // real v4 even when Tailscale returns v6-first.
-                            let ipv4 = p.ipv4.as_deref().unwrap_or("(no IPv4)");
-                            let sub = format!("{state} · {ipv4}");
-                            dot_line(ui, col, &p.name, &sub, p.online);
+                            dot_line(ui, col, &p.name, state, p.online);
                             if i < sorted.len() - 1 {
                                 ui.add_space(2.0);
                                 thin_divider(ui);
@@ -1622,8 +1619,61 @@ impl ManagerApp {
         });
     }
 
+    fn render_syncthing_card(&self, ui: &mut egui::Ui) {
+        card(
+            ui,
+            "SYNCTHING",
+            "State of the shared 'sync-state' folder that Syncthing replicates between hosts.",
+            |ui| {
+                let Some(snap) = &self.snapshot else {
+                    dot_line(ui, C_TEXT_3, "sync-state", "loading…", false);
+                    return;
+                };
+                let col = syncthing_color(&snap.syncthing);
+                let live = matches!(
+                    snap.syncthing,
+                    SyncthingState::InSync | SyncthingState::Syncing
+                );
+                let label = snap.syncthing.short_label();
+                dot_line(ui, col, "sync-state", &label, live);
+
+                let detail = snap.syncthing.detail();
+                if !detail.is_empty()
+                    && !matches!(
+                        &snap.syncthing,
+                        SyncthingState::InSync | SyncthingState::Syncing
+                    )
+                {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(detail)
+                            .family(FontFamily::Name(F_UI.into()))
+                            .color(C_TEXT_3)
+                            .size(11.5),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let link_txt = RichText::new("OPEN SYNCTHING GUI  →")
+                        .family(FontFamily::Name(F_UI_B.into()))
+                        .color(C_ACCENT)
+                        .size(11.0);
+                    if ui.link(link_txt).clicked() {
+                        let url = if self.cfg_url.trim().is_empty() {
+                            "http://127.0.0.1:8384".to_string()
+                        } else {
+                            self.cfg_url.trim().to_string()
+                        };
+                        let _ = open::that_detached(&url);
+                    }
+                });
+            },
+        );
+    }
+
     fn render_syncthing_config_card(&mut self, ui: &mut egui::Ui) {
-        card(ui, "SYNCTHING CONFIG", "API key + URL the manager uses to talk to Syncthing's REST API. Saved to manager_config.json (front-door-owned keys are preserved untouched).", |ui| {
+        card(ui, "SYNCTHING CONFIG", "API key + URL the manager uses to talk to Syncthing's REST API. Saved to manager_config.json.", |ui| {
             if let Some(err) = self.cfg_parse_err.clone() {
                 ui.label(RichText::new(format!(
                     "manager_config.json is malformed: {err}. Saving overwrites it with a clean copy."))
@@ -1632,6 +1682,7 @@ impl ManagerApp {
                 ui.add_space(6.0);
             }
 
+            // API key
             field_label(ui, "API KEY");
             ui.horizontal(|ui| {
                 let mut edit = egui::TextEdit::singleline(&mut self.cfg_api_key)
@@ -1647,6 +1698,7 @@ impl ManagerApp {
                 }
             });
 
+            // URL
             ui.add_space(10.0);
             field_label(ui, "URL  ·  optional, defaults to http://127.0.0.1:8384");
             let url_edit = egui::TextEdit::singleline(&mut self.cfg_url)
@@ -1655,51 +1707,56 @@ impl ManagerApp {
                 .font(egui::FontId::new(12.5, FontFamily::Name(F_MONO.into())));
             if ui.add(url_edit).changed() { self.cfg_dirty = self.detect_dirty(); }
 
-            ui.add_space(12.0);
+            // Buttons
+            ui.add_space(14.0);
             ui.horizontal(|ui| {
                 let can_save = self.cfg_dirty && !self.busy.any_lifecycle() && !self.busy.save_config;
-                let can_test = !self.cfg_api_key.trim().is_empty() && !self.busy.test_syncthing;
+                let can_test = !self.cfg_api_key.trim().is_empty()
+                    && !self.busy.test_syncthing && !self.busy.any_lifecycle();
                 let can_reset = self.cfg_dirty && !self.busy.save_config;
+                let save_label = if self.busy.save_config    { "SAVING…"  } else { "SAVE"            };
+                let test_label = if self.busy.test_syncthing { "TESTING…" } else { "TEST CONNECTION" };
 
-                if pill_button(ui, if self.busy.save_config { "SAVING…" } else { "SAVE" }, can_save, false).clicked() {
-                    self.busy.save_config = true;
-                    let disk = ManagerConfig {
-                        syncthing_api_key: Some(self.cfg_api_key.clone()).filter(|s| !s.trim().is_empty()),
-                        syncthing_url: Some(self.cfg_url.clone()).filter(|s| !s.trim().is_empty()),
-                        ..ManagerConfig::default()
-                    };
+                if pill_button(ui, save_label, can_save, false).clicked() {
+                    self.clear_banner(); self.busy.save_config = true;
+                    self.push_log("saving syncthing config");
+                    // Preserve the on-disk managed state + key source; only
+                    // the key/URL fields come from the input boxes.
+                    let (mut disk, _) = self.ctx.read_config();
+                    disk.syncthing_api_key = if self.cfg_api_key.trim().is_empty() { None }
+                                             else { Some(self.cfg_api_key.clone()) };
+                    disk.syncthing_url     = if self.cfg_url.trim().is_empty() { None }
+                                             else { Some(self.cfg_url.clone()) };
+                    disk.api_key_source    = Some("manual".into());
                     let _ = self.cmd_tx.send(WorkerCmd::SaveConfig(disk));
                 }
-                if pill_button(ui, if self.busy.test_syncthing { "TESTING…" } else { "TEST" }, can_test, false).clicked() {
-                    self.busy.test_syncthing = true;
+                if pill_button(ui, test_label, can_test, false).clicked() {
+                    self.clear_banner(); self.busy.test_syncthing = true;
+                    self.push_log("testing syncthing connection");
                     let _ = self.cmd_tx.send(WorkerCmd::TestSyncthing);
                 }
-                if pill_button(ui, "RESET", can_reset, true).clicked() {
+                if pill_button(ui, "RESET", can_reset, false).clicked() {
                     self.cfg_api_key = self.cfg_disk_snapshot.0.clone();
                     self.cfg_url     = self.cfg_disk_snapshot.1.clone();
                     self.cfg_dirty   = false;
+                    self.cfg_status_line = Some("Reverted to on-disk config.".into());
+                    self.push_log("config editor reset to on-disk values");
                 }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let url = if self.cfg_url.trim().is_empty() { "http://127.0.0.1:8384".to_string() } else { self.cfg_url.trim().to_string() };
-                    if ui.link(RichText::new("OPEN SYNCTHING GUI  →")
-                        .family(FontFamily::Name(F_UI_B.into()))
-                        .color(C_ACCENT).size(11.0)).clicked() { let _ = open::that_detached(&url); }
-                });
             });
 
-            if let Some(line) = &self.cfg_status_line {
+            if let Some(line) = self.cfg_status_line.clone() {
                 ui.add_space(8.0);
                 ui.label(RichText::new(line)
-                    .family(FontFamily::Name(F_MONO.into()))
-                    .color(C_TEXT_3).size(10.5));
+                    .family(FontFamily::Name(F_UI.into()))
+                    .color(C_TEXT_2).size(11.0));
             }
         });
     }
 
     fn render_version_card(&mut self, ui: &mut egui::Ui) {
-        card(ui, "VERSION", "Compare local VERSION against the latest release on GitHub. Installing replaces code only — data (chat.jsonl, sync-state) is preserved.", |ui| {
-            let installed = self.snapshot.as_ref().and_then(|s| s.version.clone()).unwrap_or_else(|| "not installed".into());
+        card(ui, "RELEASE CHANNEL", "Compare the installed VERSION file with the latest GitHub release. Install only replaces code — data is preserved.", |ui| {
+            let installed = self.snapshot.as_ref().and_then(|s| s.version.clone())
+                .unwrap_or_else(|| "(missing)".to_string());
             let latest = self.latest_tag.clone().unwrap_or_else(|| "not checked".to_string());
 
             ui.horizontal(|ui| {
@@ -1732,11 +1789,14 @@ impl ManagerApp {
                 let install_label = if self.busy.install_update { "INSTALLING…" } else { "INSTALL UPDATE" };
 
                 if pill_button(ui, check_label, can_check, false).clicked() {
-                    self.busy.check_update = true;
+                    self.clear_banner(); self.busy.check_update = true;
+                    self.push_log("checking for updates");
                     let _ = self.cmd_tx.send(WorkerCmd::CheckUpdate);
                 }
-                if pill_button(ui, install_label, can_install, false).clicked() {
-                    self.busy.install_update = true;
+                if self.can_install
+                    && pill_button(ui, install_label, can_install, false).clicked() {
+                    self.clear_banner(); self.busy.install_update = true;
+                    self.push_log("installing update");
                     let _ = self.cmd_tx.send(WorkerCmd::InstallUpdate);
                 }
             });
@@ -1744,7 +1804,13 @@ impl ManagerApp {
     }
 }
 
-// ── Worker thread ─────────────────────────────────────────────────────
+impl Drop for ManagerApp {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(WorkerCmd::Shutdown);
+    }
+}
+
+// ── Worker thread (unchanged behaviour) ───────────────────────────────
 fn spawn_worker(
     ctx: Arc<ManagerContext>,
     cmd_rx: Receiver<WorkerCmd>,
@@ -1778,6 +1844,7 @@ fn spawn_worker(
                         WorkerCmd::InstallUpdate=> { let r = ctx.install_update();     let _ = msg_tx.send(WorkerMsg::UpdateInstall(r)); }
                         WorkerCmd::SaveConfig(cfg) => { let r = ctx.save_config(cfg);  let _ = msg_tx.send(WorkerMsg::ConfigSaved(r)); }
                         WorkerCmd::TestSyncthing   => { let r = ctx.test_syncthing();  let _ = msg_tx.send(WorkerMsg::ConfigTested(r)); }
+                        // ── Syncthing control plane ──────────────────
                         WorkerCmd::SyncAutoConnect => { let m = ctx.sync_auto_connect(); let _ = msg_tx.send(WorkerMsg::SyncDone(m)); }
                         WorkerCmd::SyncLaunch      => { let m = ctx.sync_launch_syncthing(); let _ = msg_tx.send(WorkerMsg::SyncDone(m)); }
                         WorkerCmd::SyncReconcile   => {
@@ -1841,20 +1908,26 @@ fn spawn_worker(
 }
 
 // ── Pending-request event watcher (§17/§24) ───────────────────────────
+//
+// Long-polls Syncthing's event stream for PendingDevicesChanged /
+// PendingFoldersChanged. The event is ONLY the trigger; on receipt we ask
+// the worker for a refresh, which re-reads the authoritative pending state.
+// This is deliberately NOT a sleep-and-count window — events drive detection.
 fn spawn_pending_watcher(
     ctx: Arc<ManagerContext>,
     msg_tx: Sender<WorkerMsg>,
     egui_ctx: Arc<Mutex<Option<egui::Context>>>,
 ) {
     std::thread::Builder::new()
-        .name("cb-pending-watch".into())
+        .name("cb-sync-events".into())
         .spawn(move || {
             let mut since: u64 = 0;
             loop {
+                // Only poll events when connected; otherwise back off.
                 match ctx.sync_poll_pending_events(since) {
-                    Ok((fired, new_since)) => {
-                        since = new_since;
-                        if fired {
+                    Ok((relevant, next)) => {
+                        since = next;
+                        if relevant {
                             let _ = msg_tx.send(WorkerMsg::PendingChanged);
                             if let Some(c) = egui_ctx.lock().unwrap().as_ref() {
                                 c.request_repaint();
@@ -1862,17 +1935,19 @@ fn spawn_pending_watcher(
                         }
                     }
                     Err(_) => {
-                        std::thread::sleep(Duration::from_secs(5));
+                        // Not configured / unreachable / auth — wait and retry.
+                        std::thread::sleep(Duration::from_secs(10));
                     }
                 }
             }
         })
-        .expect("spawn pending watcher");
+        .expect("spawn pending-event watcher");
 }
 
 // ── FONTS ─────────────────────────────────────────────────────────────
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+
     fonts.font_data.insert(
         F_DISPLAY.into(),
         FontData::from_static(include_bytes!("assets/fonts/Michroma-Regular.ttf")),
@@ -1903,6 +1978,7 @@ fn install_fonts(ctx: &egui::Context) {
         .families
         .insert(FontFamily::Name(F_MONO.into()), vec![F_MONO.into()]);
 
+    // Also make Plex the default proportional family and Plex Mono the default mono.
     fonts
         .families
         .entry(FontFamily::Proportional)
@@ -1917,6 +1993,7 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+// ── STYLE ─────────────────────────────────────────────────────────────
 fn apply_dark_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals.window_fill = C_BG;
@@ -1961,21 +2038,17 @@ fn status_chip(ui: &mut egui::Ui, key: &str, value: &str, ok: bool) {
         });
 }
 
-fn health_visual(h: &FolderHealth) -> (Color32, &'static str) {
-    // NOTE: swapped return order vs the original (which returned glyph
-    // first, colour second) so the rail can drop the glyph without
-    // rewriting call sites. Where the glyph is still wanted, callers
-    // discard the second field.
+fn health_visual(h: &FolderHealth) -> (&'static str, Color32) {
     match h {
-        FolderHealth::InSync => (C_SUCCESS, "●"),
-        FolderHealth::Syncing { .. } => (C_ACCENT, "●"),
-        FolderHealth::Missing | FolderHealth::ConfigMismatch => (C_WARN, "▲"),
+        FolderHealth::InSync => ("●", C_SUCCESS),
+        FolderHealth::Syncing { .. } => ("●", C_ACCENT),
+        FolderHealth::Missing | FolderHealth::ConfigMismatch => ("▲", C_WARN),
         FolderHealth::AuthFailed | FolderHealth::SyncError | FolderHealth::Conflict => {
-            (C_DANGER, "●")
+            ("●", C_DANGER)
         }
-        FolderHealth::Unreachable => (C_DANGER, "●"),
-        FolderHealth::Disabled => (C_TEXT_4, "○"),
-        FolderHealth::Unknown => (C_TEXT_3, "○"),
+        FolderHealth::Unreachable => ("●", C_DANGER),
+        FolderHealth::Disabled => ("○", C_TEXT_4),
+        FolderHealth::Unknown => ("○", C_TEXT_3),
     }
 }
 
@@ -2005,6 +2078,7 @@ fn format_bytes(b: i64) -> String {
 }
 
 fn short_time(ts: &str) -> String {
+    // RFC3339 → "YYYY-MM-DD HH:MM" best effort
     let t = ts.trim();
     if t.len() >= 16 {
         let mut s = t[..16].to_string();
@@ -2016,81 +2090,225 @@ fn short_time(ts: &str) -> String {
 }
 
 fn card(ui: &mut egui::Ui, label: &str, deck: &str, body: impl FnOnce(&mut egui::Ui)) {
+    // Hover-lift animation on the card body itself
     let id = ui.id().with(("card", label));
-    let (rect_est, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 0.0), egui::Sense::hover());
-    let _ = rect_est; // shape-only allocation; egui measures the real rect below.
-    let hovered = ui.rect_contains_pointer(ui.max_rect());
-    let hover = ui.ctx().animate_bool_with_time(id, hovered, 0.15);
-    let stroke = Color32::from_rgb(
-        lerp_u8(C_BORDER_1.r(), C_BORDER_2.r(), hover),
-        lerp_u8(C_BORDER_1.g(), C_BORDER_2.g(), hover),
-        lerp_u8(C_BORDER_1.b(), C_BORDER_2.b(), hover),
-    );
+    let (rect_probe, hover_resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 0.0), egui::Sense::hover());
+    let _ = rect_probe;
+    let hovered = hover_resp.hovered();
+    let anim = ui.ctx().animate_bool_with_time(id, hovered, 0.15);
+
+    let border = lerp_color(C_BORDER_1, C_BORDER_2, anim);
     egui::Frame::none()
         .fill(C_SURFACE_2)
-        .stroke(Stroke::new(1.0_f32, stroke))
+        .stroke(Stroke::new(1.0_f32, border))
         .rounding(egui::Rounding::same(14.0))
         .inner_margin(egui::Margin::symmetric(18.0, 16.0))
+        .shadow(egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 2.0),
+            blur: 6.0 * anim,
+            spread: 0.0,
+            color: Color32::from_rgba_unmultiplied(0, 0, 0, (110.0 * anim) as u8),
+        })
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(label)
-                    .family(FontFamily::Name(F_DISPLAY.into()))
-                    .color(C_TEXT_3)
-                    .size(10.5),
-            );
-            ui.label(
-                RichText::new(deck)
-                    .family(FontFamily::Name(F_UI.into()))
-                    .color(C_TEXT_4)
-                    .size(11.0),
-            );
-            ui.add_space(10.0);
+            // Eyebrow (label) + subtitle deck
+            ui.horizontal(|ui| {
+                let (mark_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(4.0, 10.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(mark_rect, egui::Rounding::same(1.0), C_ACCENT);
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(label)
+                        .family(FontFamily::Name(F_DISPLAY.into()))
+                        .color(C_TEXT_2)
+                        .size(10.5),
+                );
+            });
+            if !deck.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(deck)
+                        .family(FontFamily::Name(F_UI.into()))
+                        .color(C_TEXT_4)
+                        .size(11.0),
+                );
+            }
+            ui.add_space(12.0);
             body(ui);
         });
 }
 
-fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
-    let t = t.clamp(0.0, 1.0);
-    (a as f32 + (b as f32 - a as f32) * t) as u8
+/// Two equal-width columns side by side (falls back to stacked on narrow widths).
+#[allow(dead_code)] // layout helper retained from v0.2; superseded by the
+                    // explicit two-column blocks in render_*_tab but kept for future cards.
+fn two_col(ui: &mut egui::Ui, left: impl FnOnce(&mut egui::Ui), right: impl FnOnce(&mut egui::Ui)) {
+    let total = ui.available_width();
+    let gap = 12.0;
+    if total < 620.0 {
+        left(ui);
+        ui.add_space(gap);
+        right(ui);
+        return;
+    }
+    let col_w = (total - gap) / 2.0;
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(col_w, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_width(col_w);
+                left(ui);
+            },
+        );
+        ui.add_space(gap);
+        ui.allocate_ui_with_layout(
+            egui::vec2(col_w, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_width(col_w);
+                right(ui);
+            },
+        );
+    });
 }
 
-fn pulse_dot(ui: &mut egui::Ui, col: Color32, live: bool, radius: f32) {
-    let id = ui.id().with(("pulse", col.to_array()));
-    let phase = ui.ctx().animate_value_with_time(id, if live { 1.0 } else { 0.0 }, 0.6);
-    let time = ui.ctx().input(|i| i.time as f32);
-    let pulse = if live { 0.7 + 0.3 * (time * 3.0).sin().abs() } else { 0.4 };
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(radius, radius), egui::Sense::hover());
-    let inner_r = radius * 0.45 * (0.6 + 0.4 * phase);
-    let outer_r = radius * 0.55 * pulse;
-    let outer = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (80.0 * phase) as u8);
-    ui.painter().circle_filled(rect.center(), outer_r, outer);
-    ui.painter().circle_filled(rect.center(), inner_r, col);
+fn thin_divider(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::ZERO, C_BORDER_1);
 }
 
-fn dot_line(ui: &mut egui::Ui, col: Color32, name: &str, sub: &str, live: bool) {
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .family(FontFamily::Name(F_DISPLAY.into()))
+            .color(C_TEXT_3)
+            .size(9.5),
+    );
+    ui.add_space(4.0);
+}
+
+/// A soft pulsing dot for "live" states — animation-driven.
+fn pulse_dot(ui: &mut egui::Ui, color: Color32, live: bool, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if live {
+        let t = ui.ctx().input(|i| i.time as f32);
+        let pulse = (t * 2.0).sin() * 0.5 + 0.5; // 0..1
+        let outer_alpha = (60.0 + 100.0 * pulse) as u8;
+        ui.painter().circle_filled(
+            rect.center(),
+            size * 0.5,
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), outer_alpha),
+        );
+        ui.painter()
+            .circle_filled(rect.center(), size * 0.28, color);
+    } else {
+        ui.painter().circle_filled(
+            rect.center(),
+            size * 0.28,
+            Color32::from_rgb(0x55, 0x55, 0x55),
+        );
+    }
+    ui.ctx().request_repaint_after(Duration::from_millis(40));
+}
+
+fn dot_line(ui: &mut egui::Ui, color: Color32, name: &str, state: &str, live: bool) {
     ui.horizontal(|ui| {
-        pulse_dot(ui, col, live, 10.0);
+        pulse_dot(ui, color, live, 10.0);
         ui.add_space(8.0);
         ui.label(
             RichText::new(name)
                 .family(FontFamily::Name(F_UI_B.into()))
                 .color(C_TEXT)
-                .size(12.0),
+                .size(12.5),
         );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(state)
+                    .family(FontFamily::Name(F_MONO.into()))
+                    .color(C_TEXT_2)
+                    .size(11.0),
+            );
+        });
+    });
+}
+
+fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.horizontal(|ui| {
         ui.label(
-            RichText::new(sub)
-                .family(FontFamily::Name(F_UI.into()))
+            RichText::new(key.to_uppercase())
+                .family(FontFamily::Name(F_DISPLAY.into()))
                 .color(C_TEXT_3)
-                .size(11.5),
+                .size(9.5),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(value)
+                    .family(FontFamily::Name(F_MONO.into()))
+                    .color(C_TEXT)
+                    .size(12.5),
+            );
+        });
+    });
+}
+
+fn version_column(ui: &mut egui::Ui, label: &str, value: &str, tone: Color32) {
+    ui.vertical(|ui| {
+        ui.label(
+            RichText::new(label)
+                .family(FontFamily::Name(F_DISPLAY.into()))
+                .color(C_TEXT_3)
+                .size(9.5),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(value)
+                .family(FontFamily::Name(F_MONO.into()))
+                .color(tone)
+                .size(20.0),
         );
     });
 }
 
-/// Rail status row — same shape as `dot_line` but stacked (key above,
-/// value below) to fit the rail's narrower column.
-fn rail_status_row(ui: &mut egui::Ui, key: &str, value: &str, col: Color32, live: bool) {
+fn legend_pill(ui: &mut egui::Ui, tag: &str, tone: Color32, meaning: &str) {
+    egui::Frame::none()
+        .fill(C_SURFACE_3)
+        .stroke(Stroke::new(1.0_f32, C_BORDER_1))
+        .rounding(egui::Rounding::same(999.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+        .outer_margin(egui::Margin {
+            left: 0.0,
+            right: 6.0,
+            top: 2.0,
+            bottom: 2.0,
+        })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 3.0, tone);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(tag)
+                        .family(FontFamily::Name(F_UI_B.into()))
+                        .color(C_TEXT)
+                        .size(10.0),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(meaning)
+                        .family(FontFamily::Name(F_UI.into()))
+                        .color(C_TEXT_3)
+                        .size(10.0),
+                );
+            });
+        });
+}
+
+fn rail_live_row(ui: &mut egui::Ui, key: &str, value: &str, tone: Color32, live: bool) {
     ui.horizontal(|ui| {
-        pulse_dot(ui, col, live, 8.0);
+        pulse_dot(ui, tone, live, 8.0);
         ui.add_space(6.0);
         ui.vertical(|ui| {
             ui.label(
@@ -2102,101 +2320,23 @@ fn rail_status_row(ui: &mut egui::Ui, key: &str, value: &str, col: Color32, live
             ui.label(
                 RichText::new(value)
                     .family(FontFamily::Name(F_UI_B.into()))
-                    .color(col)
+                    .color(tone)
                     .size(11.5),
             );
         });
     });
-    ui.add_space(6.0);
 }
 
-fn thin_divider(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, C_BORDER_1);
-}
-
-fn kv_row(ui: &mut egui::Ui, key: &str, val: &str) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(key)
-                .family(FontFamily::Name(F_MONO.into()))
-                .color(C_TEXT_4)
-                .size(11.0),
-        );
-        ui.label(
-            RichText::new(val)
-                .family(FontFamily::Name(F_MONO.into()))
-                .color(C_TEXT_2)
-                .size(11.5),
-        );
-    });
-}
-
-fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        RichText::new(text)
-            .family(FontFamily::Name(F_DISPLAY.into()))
-            .color(C_TEXT_3)
-            .size(9.5),
-    );
-    ui.add_space(2.0);
-}
-
-fn legend_pill(ui: &mut egui::Ui, label: &str, col: Color32, tip: &str) {
-    egui::Frame::none()
-        .fill(C_SURFACE_3)
-        .stroke(Stroke::new(1.0_f32, C_BORDER_1))
-        .rounding(egui::Rounding::same(999.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(label)
-                        .family(FontFamily::Name(F_UI_B.into()))
-                        .color(col)
-                        .size(10.0),
-                );
-                ui.label(
-                    RichText::new(tip)
-                        .family(FontFamily::Name(F_UI.into()))
-                        .color(C_TEXT_4)
-                        .size(10.0),
-                );
-            });
-        });
-}
-
-fn version_column(ui: &mut egui::Ui, key: &str, value: &str, col: Color32) {
-    ui.vertical(|ui| {
-        ui.label(
-            RichText::new(key)
-                .family(FontFamily::Name(F_DISPLAY.into()))
-                .color(C_TEXT_4)
-                .size(9.5),
-        );
-        ui.label(
-            RichText::new(value)
-                .family(FontFamily::Name(F_MONO.into()))
-                .color(col)
-                .size(14.0),
-        );
-    });
-}
-
-fn pill_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    enabled: bool,
-    danger: bool,
-) -> egui::Response {
+/// A pill-shaped action button with animated fill and amber hover border.
+fn pill_button(ui: &mut egui::Ui, label: &str, enabled: bool, danger: bool) -> egui::Response {
     let text = RichText::new(label)
         .family(FontFamily::Name(F_UI_B.into()))
         .color(if enabled { C_TEXT } else { C_TEXT_4 })
-        .size(11.0);
+        .size(11.5);
     let base_fill = if danger {
-        Color32::from_rgb(0x2a, 0x11, 0x11)
+        Color32::from_rgb(0x25, 0x14, 0x14)
     } else {
-        C_SURFACE_3
+        C_SURFACE_4
     };
     let stroke = if danger {
         Stroke::new(1.0_f32, Color32::from_rgb(0x4a, 0x20, 0x20))
@@ -2215,33 +2355,32 @@ fn pill_button(
 fn role_color(state: &RoleState) -> Color32 {
     match state {
         RoleState::Host => C_SUCCESS,
-        RoleState::Client | RoleState::Redirect => C_TEXT,
+        RoleState::Client => C_TEXT,
         RoleState::Idle => C_TEXT_3,
         RoleState::Starting => C_TEXT_2,
-        RoleState::Stale | RoleState::Unavailable => C_WARN,
+        RoleState::Stale => C_WARN,
         RoleState::Conflict | RoleState::Unknown => C_DANGER,
     }
 }
 
-/// Detail string for the structured `ConnectionState`. Replaces
-/// `LegacyState::detail()` — the front-door work made every user of
-/// that detail path go through this function instead.
-fn conn_state_detail(s: &ConnectionState) -> String {
+fn syncthing_color(s: &SyncthingState) -> Color32 {
     match s {
-        ConnectionState::Connected => "Syncthing REST is answering.".into(),
-        ConnectionState::AuthFailed => "Syncthing rejected the API key (401/403).".into(),
-        ConnectionState::Unreachable(d) => format!("Could not reach Syncthing: {d}"),
-        ConnectionState::NotConfigured => "No API key configured.".into(),
-        ConnectionState::BadConfig(d) => format!("manager_config.json is malformed: {d}"),
-        ConnectionState::InvalidResponse(d) => format!("Unexpected Syncthing response: {d}"),
+        SyncthingState::InSync => C_SUCCESS,
+        SyncthingState::Syncing => C_WARN,
+        SyncthingState::NotConfigured => C_TEXT_3,
+        SyncthingState::Unreachable(_) => C_WARN,
+        SyncthingState::AuthFailed
+        | SyncthingState::FolderMissing
+        | SyncthingState::BadConfig(_)
+        | SyncthingState::Error(_) => C_DANGER,
     }
 }
 
 fn section_deck(t: Tab) -> &'static str {
     match t {
-        Tab::Status  => "Reconciled role, process, and host of record for this ChatBucket instance.",
+        Tab::Status  => "Reconciled role of this ChatBucket instance, its process, and whoever holds the current host claim.",
         Tab::Sync    => "ChatBucket control plane for Syncthing: folders, devices, incoming requests, repair, and rescan.",
-        Tab::Network => "Tailnet peer list.",
+        Tab::Network => "Tailnet peer list and the Syncthing REST bridge that replicates sync-state between hosts.",
         Tab::Updates => "Compare local VERSION against the latest GitHub release. Installs replace code only — data is preserved.",
         Tab::Logs    => "Rolling ring buffer of everything the manager did — refreshes, actions, config writes, update steps.",
     }
@@ -2253,11 +2392,7 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
-// ── CLI PROBE ─────────────────────────────────────────────────────────
-//
-// Reworked: the legacy `sync-state` folder branch is gone. Instead we
-// print the front-door status and the structured sync aggregate — same
-// information the GUI's rail rows read from.
+// ── CLI PROBE (unchanged) ─────────────────────────────────────────────
 pub fn cli_probe() -> anyhow::Result<()> {
     let repo_root = crate::repo::find_repo_root_from_exe()?;
     let ctx = ManagerContext::new(repo_root.clone());
@@ -2275,37 +2410,14 @@ pub fn cli_probe() -> anyhow::Result<()> {
     }
     println!();
 
-    println!("=== front door (127.0.0.1:5050) ===");
-    match &snap.front_door {
-        None => println!("  Not responding — falling back to OS process scan."),
-        Some(fd) => {
-            println!("  routing:            {:?}", fd.routing);
-            println!("  machine:            {}", fd.machine);
-            println!("  child_running:      {}", fd.child_running);
-            println!(
-                "  child_pid:          {}",
-                fd.child_pid.map(|p| p.to_string()).unwrap_or("null".into())
-            );
-            println!("  starting:           {}", fd.starting);
-            println!(
-                "  auto_host:          {}   take_host_on_crash: {}",
-                fd.auto_host, fd.take_host_on_crash
-            );
-            if let Some(err) = &fd.last_error {
-                println!("  last_error:         {err}");
-            }
-        }
-    }
-    println!();
-
     println!("=== process ===");
     match &snap.process {
         None => println!("  Not running."),
         Some(p) => println!(
-            "  Running: pid {}, role: {}, source: {:?}",
+            "  Running: pid {}, role: {}, subshape: {:?}",
             p.pid,
             p.role.as_str(),
-            p.source,
+            p.subshape
         ),
     }
     println!();
@@ -2322,7 +2434,7 @@ pub fn cli_probe() -> anyhow::Result<()> {
     );
     println!();
 
-    println!("=== host of record ===");
+    println!("=== claimed host status ===");
     match (&snap.claimed_machine, &snap.claimed_reachability) {
         (None, _) => println!("  (no claim on record — nothing to check)"),
         (Some(name), Some(ClaimedReachability::IsSelf)) => println!("  {}: (this machine)", name),
@@ -2333,7 +2445,7 @@ pub fn cli_probe() -> anyhow::Result<()> {
     }
     println!();
 
-    println!("=== tailnet peers ===");
+    println!("=== tailnet peers (dynamic, infra hidden) ===");
     match &snap.tailnet_peers {
         Err(e) => println!("  ERROR — {e}"),
         Ok(list) => {
@@ -2343,11 +2455,9 @@ pub fn cli_probe() -> anyhow::Result<()> {
             let mut peers: Vec<&PeerInfo> = list.peers.iter().collect();
             peers.sort_by(|a, b| a.name.cmp(&b.name));
             for p in peers {
-                let ip = p.ipv4.as_deref().unwrap_or("(no IPv4)");
                 println!(
-                    "  {:20} {:20}  {}",
+                    "  {}: {}",
                     p.name,
-                    ip,
                     if p.online { "online" } else { "offline" }
                 );
             }
@@ -2361,19 +2471,18 @@ pub fn cli_probe() -> anyhow::Result<()> {
     }
     println!();
 
-    println!("=== syncthing (structured, ChatBucket resources) ===");
-    let agg = snap.sync.aggregate_health();
-    println!(
-        "  connection: {}    healthy: {}/{}",
-        snap.sync.connection.label(),
-        agg.healthy,
-        agg.total
-    );
-    for f in &snap.sync.folders {
-        println!(
-            "    {:10}  managed={:<5}  health={:?}",
-            f.label, f.managed, f.health,
-        );
+    println!("=== syncthing (sync-state folder) ===");
+    match &snap.syncthing {
+        SyncthingState::NotConfigured => {
+            println!("  not configured (no manager_config.json / syncthing_api_key)")
+        }
+        SyncthingState::InSync => println!("  in_sync"),
+        SyncthingState::Syncing => println!("  syncing"),
+        SyncthingState::AuthFailed => println!("  AUTH FAILED (Syncthing rejected the API key)"),
+        SyncthingState::Unreachable(d) => println!("  UNREACHABLE — {d}"),
+        SyncthingState::FolderMissing => println!("  FOLDER NOT FOUND ('sync-state' folder id)"),
+        SyncthingState::BadConfig(d) => println!("  BAD CONFIG — {d}"),
+        SyncthingState::Error(d) => println!("  ERROR — {d}"),
     }
     Ok(())
 }

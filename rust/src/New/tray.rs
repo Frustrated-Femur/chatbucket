@@ -1,16 +1,9 @@
 //! tray.rs — Best-effort system tray icon (feature = "tray").
 //!
-//! Under the front-door integration the tray reads role from
-//! `ManagerContext::get_role_only()` — the SAME reducer the window
-//! path uses. This is the "one source of truth" §16.5 discipline
-//! integration.md §6 makes explicit for the rail rows and applies here
-//! too: the tray badge cannot silently disagree with the window's Role
-//! card, because both come from `derive_role_state()`.
-//!
-//! When the `tray` feature is disabled (headless build without
-//! GTK/gdk-pixbuf), `spawn_tray()` is a no-op returning None. The
-//! window still opens normally in that case — same "never a hard
-//! requirement" contract as before.
+//! When the `tray` feature is disabled (e.g. headless build on a box without
+//! GTK/gdk-pixbuf), `spawn_tray()` is a no-op returning None. The window
+//! still opens normally in that case. Same "never a hard requirement"
+//! contract as Python's `_build_tray_icon()`.
 
 use crate::manager::ManagerContext;
 use std::sync::Arc;
@@ -125,27 +118,13 @@ fn tray_loop(
             }
         }
 
-        // Same reducer as the window path. Cheap: one HTTP round-trip
-        // to 127.0.0.1:5050 plus a host-state.json read; no tailscale
-        // shellout and no process-table scan (unless the front door
-        // is down, which is handled inside get_role_only).
         let rs = ctx.get_role_only();
         if let Ok(icn) = build_icon(rs.state.color_hex()) {
             let _ = tray.set_icon(Some(icn));
         }
         let _ = tray.set_tooltip(Some(format!("ChatBucket Manager — {}", rs.state.label())));
         mi_status.set_text(format!("Role: {}", rs.state.label()));
-        // Start is available whenever we're not already visibly "up".
-        // Stop is available whenever we ARE visibly "up" (HOST/CLIENT/
-        // REDIRECT/STARTING). Idle/Stale/Unavailable/Unknown → can Start.
-        let running = matches!(
-            rs.state,
-            RoleState::Host
-                | RoleState::Client
-                | RoleState::Redirect
-                | RoleState::Starting
-                | RoleState::Conflict
-        );
+        let running = !matches!(rs.state, RoleState::Idle | RoleState::Stale);
         mi_start.set_enabled(!running);
         mi_stop.set_enabled(running);
 

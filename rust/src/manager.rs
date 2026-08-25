@@ -1,25 +1,36 @@
 //! manager.rs — ManagerContext: single source of truth for all status/action logic.
 //!
-//! Direct port of Python `ManagerApi` + `_derive_role_state()`. Same discipline:
+//! Under the front-door architecture the Manager's role has narrowed but
+//! its "one source of truth" discipline is unchanged. Specifically:
 //!
-//!   * `derive_role_state()` is the ONLY reducer of (host_state, claimed, my_name,
-//!     process_info) into a Role badge. Called by BOTH the window path and the
-//!     tray path — never re-derived independently (§16.5 "one source of truth").
-//!   * `start()` blocks until the launched instance resolves to a real role
-//!     (host/client) or START_GRACE_SECONDS elapses. Same act-then-verify
-//!     discipline as Python's version.
-//!   * `stop()` handles gunicorn master/worker split: resolves the discovered
-//!     pid to the master, signals the process group (killpg on POSIX), verifies
-//!     the WHOLE lifecycle group is gone, falls back to force-kill only after
-//!     STOP_GRACE_SECONDS with a visible warning. Writes {"action":"stop"} to
-//!     host-state.json after verified exit — the "single writer" pattern the
-//!     Python code adopted to avoid racing gunicorn's own SIGTERM handler.
+//!   * `derive_role_state()` is the ONLY reducer of (front-door status,
+//!     host-state, my_name, process fallback) into a Role badge. Called by
+//!     BOTH the window path and the tray path — never re-derived
+//!     independently (§16.5 "one source of truth", integration.md §6).
+//!   * `get_status()` polls the front door FIRST (127.0.0.1:5050/status)
+//!     and derives Role/Process from that live truth. `process_scan` is
+//!     kept as an explicit "front door unreachable" fallback ONLY —
+//!     matching integration.md §4's design decision.
+//!   * `start()` / `stop()` now POST to the front-door control endpoint;
+//!     the front door owns the child process lifecycle. The gunicorn
+//!     master/worker signalling dance the old code had is dead — the
+//!     child is a plain server.py under a supervisor and the supervisor
+//!     is what we ask to stop.
+//!   * `save_config()` still writes manager_config.json for the Syncthing
+//!     keys the Rust side owns; the Python-owned booleans `auto_host` /
+//!     `take_host_on_crash` are preserved untouched thanks to the
+//!     `#[serde(flatten)] extras` field on `ManagerConfig`. When we want
+//!     to *change* those booleans we POST to /control set_config so the
+//!     front door's control queue serialises the change with its own
+//!     supervisor decisions.
 
 use crate::arbitration::{self, ArbitrationError, PeerList};
+use crate::front_door_client::{
+    ConfigPatch, FrontDoorClient, FrontDoorError, FrontDoorStatus, Routing,
+};
 use crate::host_state::{self, HostState, HostStateError};
 use crate::process_scan::{self, ProcRole, SubShape};
 use crate::resources::{self, FolderHealth};
-use crate::syncthing::LegacyState as SyncthingState;
 use crate::syncthing::{
     self, ConnectionState, DeviceAddOutcome, InstallState, ManagedTransition, ManagerConfig,
     PendingSnapshot, ReconcileReport, SyncthingController,
@@ -27,15 +38,21 @@ use crate::syncthing::{
 use crate::update::{self, GithubRelease};
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 
+// STOP_GRACE_SECONDS / START_GRACE_SECONDS from the old process-signalling
+// path are gone — the front door owns lifecycle timing now. Kept as a
+// harmless constant only for the process_scan fallback's kill_stale path.
 pub const STOP_GRACE_SECONDS: u64 = 10;
-pub const START_GRACE_SECONDS: u64 = 12;
 
-// ── Role-state vocabulary (mirrors Python `_derive_role_state()`) ───────
+// ── Role-state vocabulary ──────────────────────────────────────────────
+//
+// Adds `Redirect` for the front-door "we're a client of another host"
+// state that the old process-scan code lumped in with `Client`. The old
+// name is kept as the semantic label the GUI shows, but the enum
+// distinguishes the two so we can honestly say WHICH host we're routing
+// to instead of just "some client". Table in integration.md §4.2.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoleState {
@@ -46,41 +63,56 @@ pub enum RoleState {
     Conflict,
     Starting,
     Unknown,
+    /// Front door is currently redirecting to another host. Distinct
+    /// from the legacy `Client` (which only meant "doorman is running") —
+    /// this is the affirmative "we are a client of X" state.
+    #[allow(dead_code)] // constructed by derive_role_state, matched by GUI
+    Redirect,
+    /// Front door is up but neither hosting locally nor able to redirect.
+    /// This is the "no known host, waiting" case that the old process-
+    /// scan model couldn't express distinctly from `Idle`.
+    Unavailable,
 }
 
 impl RoleState {
-    #[allow(dead_code)] // stable string key, kept for parity with Python
     pub fn key(&self) -> &'static str {
         match self {
             RoleState::Host => "host",
             RoleState::Client => "client",
+            RoleState::Redirect => "redirect",
             RoleState::Idle => "idle",
             RoleState::Stale => "stale",
             RoleState::Conflict => "conflict",
             RoleState::Starting => "starting",
             RoleState::Unknown => "unknown",
+            RoleState::Unavailable => "unavailable",
         }
     }
     pub fn label(&self) -> &'static str {
         match self {
             RoleState::Host => "HOST",
             RoleState::Client => "CLIENT",
+            RoleState::Redirect => "CLIENT",
             RoleState::Idle => "IDLE",
             RoleState::Stale => "STALE CLAIM",
             RoleState::Conflict => "CONFLICT",
             RoleState::Starting => "STARTING",
             RoleState::Unknown => "UNKNOWN",
+            RoleState::Unavailable => "UNAVAILABLE",
         }
     }
     /// Hex color from the same palette as web/index.html's :root vars.
     pub fn color_hex(&self) -> &'static str {
         match self {
-            RoleState::Host => "#4ade80",                          // --success
-            RoleState::Client => "#f5f5f5",                        // --text
-            RoleState::Starting => "#b5b5b5",                      // --text-2
-            RoleState::Idle => "#7a7a7a",                          // --text-3
-            RoleState::Stale => "#fbbf24",                         // --warn
-            RoleState::Conflict | RoleState::Unknown => "#ff6b6b", // --danger
+            RoleState::Host => "#4ade80",       // --success
+            RoleState::Client => "#f5f5f5",     // --text
+            RoleState::Redirect => "#f5f5f5",   // --text (same visual)
+            RoleState::Starting => "#b5b5b5",   // --text-2
+            RoleState::Idle => "#7a7a7a",       // --text-3
+            RoleState::Stale => "#fbbf24",      // --warn
+            RoleState::Conflict => "#ef4444",   // --danger
+            RoleState::Unknown => "#7a7a7a",    // --text-3
+            RoleState::Unavailable => "#fbbf24",// --warn
         }
     }
 }
@@ -91,21 +123,27 @@ pub struct RoleDetail {
     pub detail: String,
 }
 
-// ── Combined snapshot the UI renders every tick ────────────────────────
+// ── StatusSnapshot ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct StatusSnapshot {
+    #[allow(dead_code)]
     pub my_name: String,
     pub host_state: Result<Option<HostState>, String>,
     pub claimed_machine: Option<String>,
     pub claimed_reachability: Option<ClaimedReachability>,
     pub tailnet_peers: Result<PeerList, String>,
+    /// Live process/routing snapshot from the front door when available;
+    /// falls back to a process_scan record when the front door is down.
     pub process: Option<ProcessInfo>,
+    /// Raw front-door status if we could reach it — the GUI uses this to
+    /// distinguish "front door says starting" from "front door is down".
+    pub front_door: Option<FrontDoorStatus>,
     pub role: RoleDetail,
     pub version: Option<String>,
-    pub syncthing: SyncthingState,
-    /// Structured ChatBucket-level Syncthing view (task §27). The GUI renders
-    /// THIS; it does not do its own Syncthing interpretation.
+    /// Structured ChatBucket-level Syncthing view (§27). The GUI renders
+    /// THIS; there is no separate `syncthing` field any more — the
+    /// legacy `sync-state` probe was removed with the front-door work.
     pub sync: SyncSnapshot,
 }
 
@@ -163,6 +201,66 @@ impl Default for SyncSnapshot {
     }
 }
 
+impl SyncSnapshot {
+    /// Worst-of aggregate over the *managed* folders. Used by the nav
+    /// rail's sync row so it agrees with the Sync tab's own aggregation
+    /// (integration.md §6). Disabled folders are excluded from the
+    /// denominator entirely — they aren't "unhealthy", they're
+    /// deliberately not managed.
+    pub fn aggregate_health(&self) -> SyncAggregate {
+        let managed: Vec<&FolderView> = self.folders.iter().filter(|f| f.managed).collect();
+        let total = managed.len();
+        if total == 0 {
+            return SyncAggregate {
+                worst: FolderHealth::Disabled, // "nothing to report"
+                healthy: 0,
+                total: 0,
+            };
+        }
+        // Health order, worst first. Anything that maps to Disabled or
+        // Unknown does not count as "unhealthy" for the aggregate colour;
+        // only sync-error / auth-failed / conflict / unreachable /
+        // missing / configmismatch do.
+        fn rank(h: &FolderHealth) -> u8 {
+            match h {
+                FolderHealth::Conflict => 0,
+                FolderHealth::AuthFailed => 1,
+                FolderHealth::SyncError => 2,
+                FolderHealth::Unreachable => 3,
+                FolderHealth::Missing => 4,
+                FolderHealth::ConfigMismatch => 5,
+                FolderHealth::Syncing { .. } => 6,
+                FolderHealth::Unknown => 7,
+                FolderHealth::InSync => 8,
+                FolderHealth::Disabled => 9,
+            }
+        }
+        let worst = managed
+            .iter()
+            .map(|f| f.health.clone())
+            .min_by_key(rank)
+            .unwrap_or(FolderHealth::Unknown);
+        let healthy = managed
+            .iter()
+            .filter(|f| matches!(f.health, FolderHealth::InSync))
+            .count();
+        SyncAggregate {
+            worst,
+            healthy,
+            total,
+        }
+    }
+}
+
+/// Result of `SyncSnapshot::aggregate_health()`. Consumed by the nav rail
+/// row so its badge and count stay identical to the Sync tab's own view.
+#[derive(Debug, Clone)]
+pub struct SyncAggregate {
+    pub worst: FolderHealth,
+    pub healthy: usize,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum ClaimedReachability {
     IsSelf,
@@ -171,11 +269,28 @@ pub enum ClaimedReachability {
     Error(String),
 }
 
+/// Rendered "process" line for the GUI. Under the front door design this
+/// mostly comes from the /status endpoint (`child_pid`, `child_running`);
+/// only if the endpoint is unreachable do we fall back to the OS-level
+/// process scanner. The `role`/`subshape` fields keep their old meaning
+/// so the process card doesn't need to know which path produced them.
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub role: ProcRole,
     pub subshape: SubShape,
+    /// Where this record came from — the GUI uses this to explain the
+    /// distinction on the process card ("via front door" vs "via OS scan").
+    pub source: ProcessSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessSource {
+    /// Reported by 127.0.0.1:5050/status — the authoritative source.
+    FrontDoor,
+    /// Discovered by scanning the OS process table — fallback only,
+    /// used when the front-door endpoint is unreachable.
+    ProcessScan,
 }
 
 // ── Action outcomes ────────────────────────────────────────────────────
@@ -183,14 +298,13 @@ pub struct ProcessInfo {
 #[derive(Debug, Clone)]
 pub struct ActionResult {
     pub ok: bool,
-    pub action: &'static str, // "started" / "graceful" / "forced" / "none" / "error"
+    pub action: &'static str, // "started" / "stopped" / "none" / "error"
     pub detail: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct UpdateCheckResult {
     pub ok: bool,
-    /// Local VERSION before install — kept in the result for diagnostics.
     #[allow(dead_code)]
     pub current: Option<String>,
     pub latest: Option<String>,
@@ -206,14 +320,17 @@ pub struct UpdateInstallResult {
     pub detail: String,
 }
 
-// ── ManagerContext: shared, thread-safe ────────────────────────────────
+// ── ManagerContext ─────────────────────────────────────────────────────
 
 pub struct ManagerContext {
     pub repo_root: PathBuf,
     pub my_name: String,
     last_update_check: Mutex<Option<GithubRelease>>,
-    /// The ChatBucket Syncthing controller (task §3). Owns all REST access.
+    /// The ChatBucket Syncthing controller (§3). Owns all Syncthing REST.
     pub syncthing: Arc<SyncthingController>,
+    /// The front-door loopback client (integration §4.4). Cheap struct;
+    /// no persistent state.
+    pub front_door: FrontDoorClient,
 }
 
 #[derive(Debug, Clone)]
@@ -224,10 +341,13 @@ pub struct ConfigSaveResult {
     /// input boxes with what actually landed on disk (whitespace stripped,
     /// trailing slash removed, empty-string → unset).
     pub saved: Option<ManagerConfig>,
-    /// A live test-connect result run against the just-saved config, so the
-    /// user gets one round-trip answer instead of "saved" → wait 30s → error.
+    /// A live test-connect result run against the just-saved config, so
+    /// the user gets one round-trip answer. This is the structured
+    /// `ConnectionState` — not the removed `LegacyState` — so we no
+    /// longer conflate "cannot reach Syncthing" with "cannot see the
+    /// old sync-state folder".
     #[allow(dead_code)]
-    pub tested: Option<SyncthingState>,
+    pub tested: Option<ConnectionState>,
 }
 
 impl ManagerContext {
@@ -239,9 +359,12 @@ impl ManagerContext {
             my_name,
             last_update_check: Mutex::new(None),
             syncthing,
+            front_door: FrontDoorClient::new(),
         }
     }
 
+    /// Full status poll — front door FIRST, everything else derived
+    /// consistently from it. Called from the worker thread.
     pub fn get_status(&self) -> StatusSnapshot {
         let hs_result = host_state::read_state(&self.repo_root);
         let (host_state_ui, claimed_machine) = match &hs_result {
@@ -250,17 +373,33 @@ impl ManagerContext {
             Err(e) => (Err(e.to_string()), None),
         };
 
-        let process_info =
-            process_scan::find_chatbucket_process(&self.repo_root).map(|p| ProcessInfo {
+        // 1. Front-door status is the primary source of truth for
+        //    "am I hosting / redirecting / starting?" and for the child
+        //    process's PID. Everything else in the snapshot is either
+        //    file-level (host-state, tailnet peers, syncthing) or a
+        //    fallback the GUI marks as such.
+        let fd = self.front_door.status().ok();
+
+        // 2. Process line derivation: front door if we have it, else
+        //    OS scan. Never both — a two-source blend would be exactly
+        //    the "two paths risk disagreement" trap integration.md §6
+        //    calls out.
+        let process_info = match &fd {
+            Some(st) => process_info_from_front_door(st),
+            None => process_scan::find_chatbucket_process(&self.repo_root).map(|p| ProcessInfo {
                 pid: p.pid,
                 role: p.role,
                 subshape: p.subshape,
-            });
+                source: ProcessSource::ProcessScan,
+            }),
+        };
 
+        // 3. Role reducer — single-source discipline.
         let role = derive_role_state(
             &hs_result,
             claimed_machine.as_deref(),
             &self.my_name,
+            fd.as_ref(),
             process_info.as_ref(),
         );
 
@@ -287,70 +426,79 @@ impl ManagerContext {
             claimed_reachability,
             tailnet_peers,
             process: process_info,
+            front_door: fd,
             role,
             version: update::read_local_version(&self.repo_root),
-            syncthing: syncthing::get_status(&self.repo_root),
             sync,
         }
     }
 
-    /// Cheap subset for the tray icon's 5s poll — host_state + local process
-    /// scan only, no tailscale CLI shellout. Same intent as Python's
-    /// `_tray_role_state()`.
+    /// Cheap subset for the tray icon's 5s poll — front door only, plus
+    /// host_state for the STALE case. NO tailscale CLI, no process scan.
+    /// Same "one reducer" discipline as `get_status`: both call the
+    /// SAME `derive_role_state()`, just with fewer inputs.
     pub fn get_role_only(&self) -> RoleDetail {
         let hs = host_state::read_state(&self.repo_root);
         let claimed = match &hs {
             Ok(Some(s)) => Some(s.machine.clone()),
             _ => None,
         };
-        let proc = process_scan::find_chatbucket_process(&self.repo_root).map(|p| ProcessInfo {
-            pid: p.pid,
-            role: p.role,
-            subshape: p.subshape,
-        });
-        derive_role_state(&hs, claimed.as_deref(), &self.my_name, proc.as_ref())
+        let fd = self.front_door.status().ok();
+        // Only scan the OS if the front door is down — otherwise we'd
+        // pay a process-table walk on every 5s tray tick for no gain.
+        let proc = match &fd {
+            Some(st) => process_info_from_front_door(st),
+            None => process_scan::find_chatbucket_process(&self.repo_root).map(|p| ProcessInfo {
+                pid: p.pid,
+                role: p.role,
+                subshape: p.subshape,
+                source: ProcessSource::ProcessScan,
+            }),
+        };
+        derive_role_state(&hs, claimed.as_deref(), &self.my_name, fd.as_ref(), proc.as_ref())
     }
 
     // ── Manager config (Syncthing API key + URL) ───────────────────
 
-    /// Read the current on-disk config. Returns `(config, parse_error)`.
-    /// A parse error means the file exists but is malformed — the GUI
-    /// should render that inline instead of silently blanking the boxes.
     pub fn read_config(&self) -> (ManagerConfig, Option<String>) {
         syncthing::read_config(&self.repo_root)
     }
 
-    /// Save a new config atomically. The GUI passes what the user typed;
-    /// this method does the whitespace/quote normalisation on the way in,
-    /// invalidates the status cache, and (for user feedback) runs an
-    /// immediate test-connect against the just-saved config so the user
-    /// sees "OK / auth failed / unreachable" without waiting 30s.
+    /// Save a new config atomically. Preserves the Python-owned
+    /// `auto_host` / `take_host_on_crash` keys via the flatten-extras
+    /// discipline in `ManagerConfig`. Runs a live probe against the
+    /// saved config so the user gets one round-trip verdict.
     pub fn save_config(&self, cfg: ManagerConfig) -> ConfigSaveResult {
         match syncthing::save_config(&self.repo_root, cfg) {
             Ok(saved) => {
-                // Only test if there IS actually a key to test against —
+                // Only probe if there IS actually a key to probe with —
                 // saving an empty key intentionally clears the config,
                 // which should not surface as "unreachable".
                 let tested = if saved.key().is_some() {
-                    Some(syncthing::test_now(&self.repo_root))
+                    // Force-invalidate the cache and re-probe.
+                    self.syncthing.invalidate();
+                    Some(self.syncthing.connection_state())
                 } else {
                     None
                 };
                 let detail = match &tested {
                     None => "Config saved. Syncthing probe disabled (no API key).".to_string(),
-                    Some(SyncthingState::InSync) => "Saved. Connected — folder in sync.".into(),
-                    Some(SyncthingState::Syncing) => "Saved. Connected — folder syncing.".into(),
-                    Some(SyncthingState::AuthFailed) => {
+                    Some(ConnectionState::Connected) => "Saved. Connected to Syncthing.".into(),
+                    Some(ConnectionState::AuthFailed) => {
                         "Saved, but Syncthing rejected the key (401/403).".into()
                     }
-                    Some(SyncthingState::Unreachable(d)) => {
+                    Some(ConnectionState::Unreachable(d)) => {
                         format!("Saved, but could not reach Syncthing: {d}")
                     }
-                    Some(SyncthingState::FolderMissing) => format!(
-                        "Saved, but Syncthing has no folder id '{}'.",
-                        syncthing::FOLDER_ID
-                    ),
-                    Some(other) => format!("Saved. Status: {}", other.short_label()),
+                    Some(ConnectionState::NotConfigured) => {
+                        "Saved. No API key configured.".into()
+                    }
+                    Some(ConnectionState::BadConfig(d)) => {
+                        format!("Saved, but config is malformed: {d}")
+                    }
+                    Some(ConnectionState::InvalidResponse(d)) => {
+                        format!("Saved, but Syncthing gave an unexpected response: {d}")
+                    }
                 };
                 ConfigSaveResult {
                     ok: true,
@@ -368,17 +516,28 @@ impl ManagerContext {
         }
     }
 
-    /// Force a fresh Syncthing probe (skips the 30s cache). Used by the
-    /// "Test connection" button next to the API key input.
-    pub fn test_syncthing(&self) -> SyncthingState {
-        syncthing::test_now(&self.repo_root)
+    /// Force a fresh Syncthing probe. Used by the "Test connection"
+    /// button next to the API key input. Returns the structured
+    /// `ConnectionState`; there is no longer a separate legacy probe.
+    pub fn test_syncthing(&self) -> ConnectionState {
+        self.syncthing.invalidate();
+        self.syncthing.connection_state()
+    }
+
+    /// Push `auto_host` / `take_host_on_crash` to the front door via
+    /// /control set_config. The Python side is what actually persists
+    /// them (into manager_config.json) — routing them through the
+    /// control endpoint keeps the front door's control queue as the
+    /// single writer, avoiding the file-race the .md's §4.4 flags.
+    #[allow(dead_code)] // wired into the front-door panel when it lands
+    pub fn push_front_door_config(&self, patch: ConfigPatch) -> Result<(), String> {
+        self.front_door
+            .set_config(patch)
+            .map_err(|e| format!("front door rejected config: {e}"))
     }
 
     // ── Syncthing integration (ChatBucket control plane) ────────────
 
-    /// Build the structured ChatBucket-facing Syncthing snapshot. This is the
-    /// ONLY place raw Syncthing state is reduced into FolderView/DeviceView;
-    /// the GUI renders it without doing its own interpretation (§27).
     pub fn sync_snapshot(&self) -> SyncSnapshot {
         let install = self.syncthing.install_state();
         let connection = self.syncthing.connection_state();
@@ -452,15 +611,15 @@ impl ManagerContext {
             folders.push(view);
         }
 
-        // Devices: those referenced by ChatBucket folders, plus pending.
+        // Devices: those referenced by ChatBucket folders (self-filtered
+        // inside all_chatbucket_device_associations — see §1), plus
+        // pending. If we're not connected we can't build the list.
         let devices = if connected {
             self.build_device_views()
         } else {
             Vec::new()
         };
 
-        // Pending requests are EVENT-driven elsewhere; here we just take a
-        // fresh read so the snapshot always reflects current pending state.
         let pending = if connected {
             self.syncthing.pending_snapshot().ok()
         } else {
@@ -492,15 +651,8 @@ impl ManagerContext {
             .iter()
             .map(|r| r.folder_id.to_string())
             .collect();
-        // Collect device→folders mapping across ChatBucket folders.
-        let mut assoc: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        for fid in &managed_ids {
-            if let Ok(st) = self.syncthing.folder_status(fid) {
-                let _ = st; // status presence implies folder configured
-            }
-        }
-        // We derive association from config, not status. Ask the controller.
+        // Self-filter and unrelated-folder-filter both live inside this
+        // call — see the docstring on all_chatbucket_device_associations.
         let configured = self.syncthing.all_chatbucket_device_associations();
         let mut out = Vec::new();
         for (device_id, folders) in configured {
@@ -511,7 +663,6 @@ impl ManagerContext {
                 connected: self.syncthing.device_connected(&device_id),
                 fully_associated: fully,
             });
-            assoc.insert(device_id, folders.len());
         }
         out
     }
@@ -608,210 +759,77 @@ impl ManagerContext {
             .map_err(|e| e.to_string())
     }
 
-    /// One iteration of the pending-event watcher: long-poll for a relevant
-    /// event, then return the fresh pending snapshot if one fired (§17/§24).
     pub fn sync_poll_pending_events(&self, since: u64) -> Result<(bool, u64), String> {
         self.syncthing
             .wait_for_pending_event(since)
             .map_err(|e| e.to_string())
     }
 
-    /// Read current pending state directly (used after an event fires).
-    #[allow(dead_code)] // event watcher uses poll_events; kept for direct reads
+    #[allow(dead_code)]
     pub fn sync_pending_snapshot(&self) -> Result<PendingSnapshot, String> {
         self.syncthing.pending_snapshot().map_err(|e| e.to_string())
     }
 
-    // ── start() ─────────────────────────────────────────────────────
+    // ── start() / stop() — now delegated to the front door ─────────
+    //
+    // These used to spawn/kill the whole Python process; under the
+    // front-door design that process is persistent and owns its own
+    // child. We just POST to /control and the supervisor does the work.
+    // If /control is unreachable we surface that honestly — we DO NOT
+    // try to spawn a Python process ourselves as a fallback, because
+    // that would race the front door if it happens to come back up.
 
     pub fn start(&self) -> ActionResult {
-        process_scan::kill_stale_arbitrators(&self.repo_root);
-
-        if let Some(existing) = process_scan::find_chatbucket_process(&self.repo_root) {
-            return ActionResult {
-                ok: true,
-                action: "none",
-                detail: format!(
-                    "Already running (pid {}, role: {})",
-                    existing.pid,
-                    existing.role.as_str()
-                ),
-            };
-        }
-
-        let python = venv_python(&self.repo_root);
-        let main_py = self.repo_root.join("main.py");
-        if !python.exists() {
-            return ActionResult {
-                ok: false,
-                action: "error",
-                detail: format!("venv Python not found at {}", python.display()),
-            };
-        }
-        if !main_py.exists() {
-            return ActionResult {
-                ok: false,
-                action: "error",
-                detail: format!("main.py not found at {}", main_py.display()),
-            };
-        }
-
-        let child = spawn_main_py(&python, &main_py, &self.my_name, &self.repo_root);
-        let pid = match child {
-            Ok(c) => c.id(),
-            Err(e) => {
-                return ActionResult {
-                    ok: false,
-                    action: "error",
-                    detail: format!("Failed to launch: {e}"),
-                }
-            }
-        };
-
-        let resolved = wait_for_role(&self.repo_root, pid, START_GRACE_SECONDS);
-        match resolved {
-            Some(role) => ActionResult {
+        match self.front_door.start() {
+            Ok(()) => ActionResult {
                 ok: true,
                 action: "started",
+                detail: "Start requested — the front door will attempt to claim host."
+                    .into(),
+            },
+            Err(FrontDoorError::Unreachable(d)) => ActionResult {
+                ok: false,
+                action: "error",
                 detail: format!(
-                    "Launched and confirmed as {} (pid {})",
-                    role.as_str().to_uppercase(),
-                    pid
+                    "Front door is not running on 127.0.0.1:5050 ({d}). Launch main.py first \
+                     — the Manager no longer spawns it directly under the front-door design."
                 ),
             },
-            None => {
-                // One more scan in case a race put a matching process there
-                // under a different pid (gunicorn worker fork, supervisor).
-                if let Some(final_proc) = process_scan::find_chatbucket_process(&self.repo_root) {
-                    if final_proc.role != ProcRole::Arbitrating {
-                        return ActionResult {
-                            ok: true,
-                            action: "started",
-                            detail: format!(
-                                "Launched and confirmed as {} (pid {})",
-                                final_proc.role.as_str().to_uppercase(),
-                                final_proc.pid
-                            ),
-                        };
-                    }
-                }
+            Err(e) => ActionResult {
+                ok: false,
+                action: "error",
+                detail: format!("Start rejected: {e}"),
+            },
+        }
+    }
+
+    pub fn stop(&self) -> ActionResult {
+        match self.front_door.stop() {
+            Ok(()) => ActionResult {
+                ok: true,
+                action: "stopped",
+                detail: "Stop requested — the front door will release its child.".into(),
+            },
+            Err(FrontDoorError::Unreachable(d)) => {
+                // The old code force-killed the process group here.
+                // Under the front-door design that would only orphan the
+                // supervisor's tracking, not actually stop anything if
+                // the supervisor is up. Surface honestly.
                 ActionResult {
-                    ok: true,
-                    action: "started_unconfirmed",
+                    ok: false,
+                    action: "error",
                     detail: format!(
-                        "Launched (pid {}) but couldn't confirm HOST/CLIENT within {}s — \
-                         may still be arbitrating. Check again shortly.",
-                        pid, START_GRACE_SECONDS
+                        "Front door is not responding ({d}). If a stray server.py is running \
+                         you can kill it manually — but under normal operation the front door \
+                         is the only thing that should be signalling the child."
                     ),
                 }
             }
-        }
-    }
-
-    // ── stop() ──────────────────────────────────────────────────────
-
-    pub fn stop(&self) -> ActionResult {
-        let Some(proc) = process_scan::find_chatbucket_process(&self.repo_root) else {
-            process_scan::kill_stale_arbitrators(&self.repo_root);
-            self.mark_stopped_if_mine();
-            return ActionResult {
-                ok: true,
-                action: "none",
-                detail: "ChatBucket is not running.".into(),
-            };
-        };
-
-        let target_pid = if proc.subshape == SubShape::GunicornWorker {
-            process_scan::resolve_master(proc.pid, &self.repo_root)
-        } else {
-            proc.pid
-        };
-
-        // Every lifecycle pid discoverable globally, so verification confirms
-        // the WHOLE group is down — matches Python's `related` set.
-        let related_pids: Vec<u32> = process_scan::iter_chatbucket_procs(&self.repo_root)
-            .into_iter()
-            .map(|p| p.pid)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .chain(std::iter::once(target_pid))
-            .collect();
-
-        // ── graceful signal ───────────────────────────────────────
-        let graceful_label = self.send_graceful_signal(target_pid);
-
-        if process_scan::wait_for_all_gone(&related_pids, STOP_GRACE_SECONDS) {
-            process_scan::kill_stale_arbitrators(&self.repo_root);
-            self.mark_stopped_if_mine();
-            return ActionResult {
-                ok: true,
-                action: "graceful",
-                detail: format!(
-                    "Stopped via {} (target pid {}).",
-                    graceful_label, target_pid
-                ),
-            };
-        }
-
-        // ── force stop path ──────────────────────────────────────
-        // Kill the master first so it stops respawning workers, then the rest.
-        process_scan::force_kill_pid(target_pid);
-        for pid in &related_pids {
-            if *pid != target_pid {
-                process_scan::force_kill_pid(*pid);
-            }
-        }
-        let force_ok = process_scan::wait_for_all_gone(&related_pids, 5);
-        process_scan::kill_stale_arbitrators(&self.repo_root);
-        if force_ok {
-            self.mark_stopped_if_mine();
-        }
-        ActionResult {
-            ok: force_ok,
-            action: "forced",
-            detail: format!(
-                "Graceful stop via {} did not complete within {}s — force-stopped \
-                 {} process(es). host-state.json may be stale until another \
-                 machine's health check catches it.",
-                graceful_label,
-                STOP_GRACE_SECONDS,
-                related_pids.len()
-            ),
-        }
-    }
-
-    #[cfg(unix)]
-    fn send_graceful_signal(&self, target_pid: u32) -> String {
-        if let Some(pgid) = process_scan::get_pgid(target_pid) {
-            if process_scan::send_sigterm_pgid(pgid) {
-                return format!("SIGTERM to pgid {}", pgid);
-            }
-        }
-        if process_scan::send_sigterm_pid(target_pid) {
-            "SIGTERM".into()
-        } else {
-            "SIGTERM (send failed)".into()
-        }
-    }
-
-    #[cfg(windows)]
-    fn send_graceful_signal(&self, target_pid: u32) -> String {
-        if process_scan::send_ctrl_break_windows(target_pid) {
-            "CTRL_BREAK_EVENT".into()
-        } else {
-            "CTRL_BREAK_EVENT (call failed)".into()
-        }
-    }
-
-    fn mark_stopped_if_mine(&self) {
-        let Ok(Some(state)) = host_state::read_state(&self.repo_root) else {
-            return;
-        };
-        if state.machine != self.my_name || state.action == "stop" {
-            return;
-        }
-        if let Err(e) = host_state::write_state(&self.repo_root, "stop", &self.my_name) {
-            log::warn!("could not mark stop in host-state.json: {e}");
+            Err(e) => ActionResult {
+                ok: false,
+                action: "error",
+                detail: format!("Stop rejected: {e}"),
+            },
         }
     }
 
@@ -861,7 +879,6 @@ impl ManagerContext {
     }
 
     pub fn install_update(&self) -> UpdateInstallResult {
-        // Re-check every time (release could be yanked between clicks).
         let pre = self.check_for_updates();
         if !pre.ok {
             return UpdateInstallResult {
@@ -877,6 +894,7 @@ impl ManagerContext {
                 detail: pre.detail,
             };
         }
+        // Ask the front door to stop its child before we swap code.
         let stop_result = self.stop();
         if !stop_result.ok {
             return UpdateInstallResult {
@@ -983,7 +1001,8 @@ impl ManagerContext {
             ok: true,
             step: "done",
             detail: format!(
-                "Updated to {}. Click Start to relaunch — restart goes through arbitration on purpose, not straight back into the prior role.",
+                "Updated to {}. Ask the front door (or restart main.py) to relaunch — \
+                 restart goes through arbitration on purpose, not straight back into the prior role.",
                 new_v
             ),
         }
@@ -1010,104 +1029,55 @@ pub fn normalize_name(name: &str) -> String {
     name.split('.').next().unwrap_or("").trim().to_lowercase()
 }
 
-pub fn venv_python(repo_root: &std::path::Path) -> PathBuf {
-    #[cfg(windows)]
-    {
-        repo_root.join(".venv").join("Scripts").join("python.exe")
+/// Convert a `FrontDoorStatus` into a `ProcessInfo` record, or None if
+/// the front door reports no child. This is the "front door tells us
+/// directly" path — no OS scan, no gunicorn shape guessing.
+fn process_info_from_front_door(st: &FrontDoorStatus) -> Option<ProcessInfo> {
+    let pid = st.child_pid?;
+    if !st.child_running {
+        // The front door tracks child_pid across the brief post-exit
+        // window; if child_running is false the process is gone or
+        // going, and we should not claim it as running.
+        return None;
     }
-    #[cfg(not(windows))]
-    {
-        repo_root.join(".venv").join("bin").join("python")
-    }
+    // The child is server.py under a supervisor: role is always Host in
+    // ChatBucket terms (the doorman/client roles used to be a separate
+    // process; now they're just routing decisions in the front door and
+    // there is no distinct client process to point at). Use the shape
+    // enum to record that this is a plain-server child, not gunicorn.
+    let role = match st.routing {
+        Routing::Local => ProcRole::Host,
+        _ => ProcRole::Host, // child_running is only true when we're hosting
+    };
+    Some(ProcessInfo {
+        pid,
+        role,
+        subshape: SubShape::PythonServer,
+        source: ProcessSource::FrontDoor,
+    })
 }
 
-fn spawn_main_py(
-    python: &std::path::Path,
-    main_py: &std::path::Path,
-    machine: &str,
-    cwd: &std::path::Path,
-) -> std::io::Result<std::process::Child> {
-    let mut cmd = Command::new(python);
-    cmd.arg(main_py)
-        .arg(machine)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    #[cfg(unix)]
-    {
-        // New session so a SIGTERM aimed at our pid can, if needed, be
-        // turned into a process-group signal without also signalling the
-        // Manager itself. Same intent as Python's start_new_session=True.
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                // setsid() — become session leader, new process group.
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NEW_PROCESS_GROUP — required for later CTRL_BREAK_EVENT.
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-    }
-
-    cmd.spawn()
-}
-
-fn wait_for_role(repo_root: &std::path::Path, pid: u32, timeout_secs: u64) -> Option<ProcRole> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    let poll = Duration::from_millis(400);
-    loop {
-        if let Some(proc) = process_scan::find_chatbucket_process(repo_root) {
-            if proc.role != ProcRole::Arbitrating {
-                // Accept the same pid, or any resolved role — the launched
-                // main.py may have execv'd into gunicorn (pid preserved) or
-                // gunicorn's master may have forked a worker (child pid).
-                if proc.pid == pid || pid_close_relative(pid, proc.pid) {
-                    return Some(proc.role);
-                }
-                // Even for an unrelated pid: if it's the only ChatBucket
-                // process we can see and it just appeared, accept it.
-                return Some(proc.role);
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(poll);
-    }
-}
-
-fn pid_close_relative(a: u32, b: u32) -> bool {
-    // If both pids are alive and appeared close together in time, treat as
-    // "same lifecycle group". Mirrors Python's create_time proximity check.
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes();
-    let ta = sys
-        .process(sysinfo::Pid::from_u32(a))
-        .map(|p| p.start_time());
-    let tb = sys
-        .process(sysinfo::Pid::from_u32(b))
-        .map(|p| p.start_time());
-    match (ta, tb) {
-        (Some(ta), Some(tb)) => (ta as i64 - tb as i64).unsigned_abs() < START_GRACE_SECONDS,
-        _ => false,
-    }
-}
-
+/// The single reducer of (host_state, front-door status, process info)
+/// into a Role badge. Both `get_status` and `get_role_only` MUST call
+/// this — no ad-hoc derivations elsewhere.
+///
+/// Priority order (integration.md §4.2, adapted for the real Python
+/// contract we verified against front_door.py):
+///
+///   1. host_state.json corrupted → Unknown (surface loudly).
+///   2. Front door reachable → treat its `routing` + `starting` as
+///      authoritative. process_info here is coming from the front door,
+///      so this branch is single-source by construction.
+///   3. Front door unreachable → we fall back to (host_state + process
+///      scan) exactly like the pre-front-door code. process_info here
+///      is from the OS scan; we mark this in `detail` so the user
+///      knows the front door is down.
+///   4. No front door + no process + no claim → Idle.
 pub fn derive_role_state(
     hs: &Result<Option<HostState>, HostStateError>,
     claimed_machine: Option<&str>,
     my_name: &str,
+    front_door: Option<&FrontDoorStatus>,
     process: Option<&ProcessInfo>,
 ) -> RoleDetail {
     if hs.is_err() {
@@ -1117,6 +1087,78 @@ pub fn derive_role_state(
         };
     }
 
+    // ── Front-door-authoritative branch ─────────────────────────────
+    if let Some(fd) = front_door {
+        // `starting` means the pointer is transitioning — the front
+        // door itself calls this state out explicitly and we should
+        // not try to second-guess it.
+        if fd.starting {
+            let hint = fd
+                .last_error
+                .as_deref()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default();
+            return RoleDetail {
+                state: RoleState::Starting,
+                detail: format!("Front door is arbitrating / transitioning{hint}"),
+            };
+        }
+
+        return match &fd.routing {
+            Routing::Local => {
+                // We are hosting locally. child_running=false here
+                // during the tiny gap between claim-decided and
+                // child-bound; distinguish that from real Host.
+                if fd.child_running {
+                    RoleDetail {
+                        state: RoleState::Host,
+                        detail: "This machine is currently serving ChatBucket.".into(),
+                    }
+                } else {
+                    RoleDetail {
+                        state: RoleState::Starting,
+                        detail: "Front door claimed HOST but child hasn't come up yet."
+                            .into(),
+                    }
+                }
+            }
+            Routing::Redirect(m) => RoleDetail {
+                state: RoleState::Redirect,
+                detail: format!("Redirecting to host: {m}"),
+            },
+            Routing::Unavailable => {
+                // Front door is up but no host is known. If host-state
+                // claims someone specific we surface that, otherwise
+                // Idle. Distinguished from the pre-front-door Idle
+                // because the front door being up gives us a positive
+                // "no one is hosting" signal rather than a
+                // "we don't know" one.
+                match claimed_machine {
+                    Some(m) if m == my_name => RoleDetail {
+                        state: RoleState::Stale,
+                        detail: "host-state.json claims THIS machine but the front door isn't hosting — likely a crashed-then-cleared claim.".into(),
+                    },
+                    Some(m) => RoleDetail {
+                        state: RoleState::Unavailable,
+                        detail: format!(
+                            "No host reachable. host-state.json claims {m}, but it's offline."
+                        ),
+                    },
+                    None => RoleDetail {
+                        state: RoleState::Idle,
+                        detail: "No claim on record — nobody has ever hosted.".into(),
+                    },
+                }
+            }
+        };
+    }
+
+    // ── Fallback branch: front door unreachable ─────────────────────
+    // This is the pre-front-door path, unchanged, except that we tell
+    // the user in `detail` that the front door is down. It's OK to be
+    // here on first boot (front door hasn't launched yet) or during a
+    // Manager-launched-first sequence — the GUI should not treat this
+    // as an error.
     let running = process.is_some();
     let proc_role = process.map(|p| &p.role);
 
@@ -1138,7 +1180,7 @@ pub fn derive_role_state(
         if running && proc_role == Some(&ProcRole::Host) {
             return RoleDetail {
                 state: RoleState::Host,
-                detail: "This machine is currently serving ChatBucket.".into(),
+                detail: "This machine is currently serving ChatBucket (front door unreachable — falling back to OS scan).".into(),
             };
         }
         return RoleDetail {
@@ -1164,6 +1206,246 @@ pub fn derive_role_state(
     }
     RoleDetail {
         state: RoleState::Client,
-        detail: format!("Host is currently: {} (no local doorman running).", claimed),
+        detail: format!("Host is currently: {} (front door unreachable, no local server running).", claimed),
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::front_door_client::Routing;
+
+    fn fd(routing: Routing, child_running: bool, starting: bool) -> FrontDoorStatus {
+        FrontDoorStatus {
+            routing,
+            machine: "archlinux".into(),
+            child_running,
+            child_pid: if child_running { Some(999) } else { None },
+            starting,
+            last_error: None,
+            auto_host: true,
+            take_host_on_crash: false,
+        }
+    }
+
+    fn hs_start(m: &str) -> Result<Option<HostState>, HostStateError> {
+        Ok(Some(HostState {
+            action: "start".into(),
+            machine: m.into(),
+            timestamp: "2026-01-01T00:00:00.000000Z".into(),
+        }))
+    }
+
+    // ── §4.2 table: every row of the front-door-reachable branch ────
+
+    #[test]
+    fn role_map_local_child_up_is_host() {
+        let s = derive_role_state(
+            &hs_start("archlinux"),
+            Some("archlinux"),
+            "archlinux",
+            Some(&fd(Routing::Local, true, false)),
+            None,
+        );
+        assert_eq!(s.state, RoleState::Host);
+    }
+
+    #[test]
+    fn role_map_local_child_down_is_starting() {
+        // Local pointer but child hasn't bound yet — the brief gap
+        // between claim-decided and 5001-listening.
+        let s = derive_role_state(
+            &hs_start("archlinux"),
+            Some("archlinux"),
+            "archlinux",
+            Some(&fd(Routing::Local, false, false)),
+            None,
+        );
+        assert_eq!(s.state, RoleState::Starting);
+    }
+
+    #[test]
+    fn role_map_redirect_is_redirect() {
+        let s = derive_role_state(
+            &hs_start("archlinux"),
+            Some("archlinux"),
+            "win1",
+            Some(&fd(Routing::Redirect("archlinux".into()), false, false)),
+            None,
+        );
+        assert_eq!(s.state, RoleState::Redirect);
+        assert!(s.detail.contains("archlinux"));
+    }
+
+    #[test]
+    fn role_map_unavailable_no_claim_is_idle() {
+        let s = derive_role_state(
+            &Ok(None),
+            None,
+            "archlinux",
+            Some(&fd(Routing::Unavailable, false, false)),
+            None,
+        );
+        assert_eq!(s.state, RoleState::Idle);
+    }
+
+    #[test]
+    fn role_map_unavailable_with_claim_someone_else_is_unavailable() {
+        let s = derive_role_state(
+            &hs_start("win1"),
+            Some("win1"),
+            "archlinux",
+            Some(&fd(Routing::Unavailable, false, false)),
+            None,
+        );
+        assert_eq!(s.state, RoleState::Unavailable);
+        assert!(s.detail.contains("win1"));
+    }
+
+    #[test]
+    fn role_map_unavailable_with_self_claim_is_stale() {
+        // We used to host but the front door isn't hosting now — that's
+        // the "crashed then cleared" case that only STALE captures.
+        let s = derive_role_state(
+            &hs_start("archlinux"),
+            Some("archlinux"),
+            "archlinux",
+            Some(&fd(Routing::Unavailable, false, false)),
+            None,
+        );
+        assert_eq!(s.state, RoleState::Stale);
+    }
+
+    #[test]
+    fn role_map_starting_flag_wins_over_routing() {
+        // If starting=true, we must not read Local/Redirect literally —
+        // the front door itself is between decisions.
+        let s = derive_role_state(
+            &hs_start("archlinux"),
+            Some("archlinux"),
+            "archlinux",
+            Some(&fd(Routing::Local, true, true)),
+            None,
+        );
+        assert_eq!(s.state, RoleState::Starting);
+    }
+
+    #[test]
+    fn role_map_corrupt_host_state_is_unknown() {
+        let hs: Result<Option<HostState>, HostStateError> =
+            Err(HostStateError::InvalidAction {
+                path: "x".into(),
+                action: "wat".into(),
+            });
+        let s = derive_role_state(
+            &hs,
+            None,
+            "archlinux",
+            Some(&fd(Routing::Local, true, false)),
+            None,
+        );
+        assert_eq!(s.state, RoleState::Unknown);
+    }
+
+    // ── §4.2 fallback branch — front door down, process scan drives ──
+
+    #[test]
+    fn fallback_no_process_no_claim_is_idle() {
+        let s = derive_role_state(&Ok(None), None, "archlinux", None, None);
+        assert_eq!(s.state, RoleState::Idle);
+    }
+
+    #[test]
+    fn fallback_self_claim_no_process_is_stale() {
+        let s = derive_role_state(
+            &hs_start("archlinux"),
+            Some("archlinux"),
+            "archlinux",
+            None,
+            None,
+        );
+        assert_eq!(s.state, RoleState::Stale);
+    }
+
+    #[test]
+    fn fallback_someone_else_claim_no_process_is_client() {
+        let s = derive_role_state(&hs_start("win1"), Some("win1"), "archlinux", None, None);
+        assert_eq!(s.state, RoleState::Client);
+        assert!(s.detail.contains("front door unreachable"));
+    }
+
+    #[test]
+    fn fallback_arbitrating_process_is_starting() {
+        let p = ProcessInfo {
+            pid: 1,
+            role: ProcRole::Arbitrating,
+            subshape: SubShape::Arbitrating,
+            source: ProcessSource::ProcessScan,
+        };
+        let s = derive_role_state(&Ok(None), None, "archlinux", None, Some(&p));
+        assert_eq!(s.state, RoleState::Starting);
+    }
+
+    // ── §6: sync-aggregate rail row ────────────────────────────────
+
+    #[test]
+    fn aggregate_ignores_disabled_folders() {
+        let mut snap = SyncSnapshot::default();
+        for def in resources::RESOURCES {
+            snap.folders.push(FolderView {
+                folder_id: def.folder_id.to_string(),
+                label: def.label,
+                managed: def.folder_id != resources::ID_STICKERS, // stickers disabled
+                health: if def.folder_id == resources::ID_STICKERS {
+                    FolderHealth::Disabled
+                } else {
+                    FolderHealth::InSync
+                },
+                need_files: 0,
+                need_bytes: 0,
+                pull_errors: 0,
+                error_count: 0,
+                last_scan: String::new(),
+                has_conflict: false,
+            });
+        }
+        let agg = snap.aggregate_health();
+        // 7 folders total, 1 disabled → denominator is 6, all healthy.
+        assert_eq!(agg.total, 6);
+        assert_eq!(agg.healthy, 6);
+        assert!(matches!(agg.worst, FolderHealth::InSync));
+    }
+
+    #[test]
+    fn aggregate_worst_wins() {
+        let mut snap = SyncSnapshot::default();
+        for def in resources::RESOURCES {
+            let health = match def.folder_id {
+                x if x == resources::ID_STATE => FolderHealth::Conflict,
+                x if x == resources::ID_UPLOADS => FolderHealth::Syncing {
+                    need_files: 3,
+                    need_bytes: 1024,
+                },
+                _ => FolderHealth::InSync,
+            };
+            snap.folders.push(FolderView {
+                folder_id: def.folder_id.to_string(),
+                label: def.label,
+                managed: true,
+                health,
+                need_files: 0,
+                need_bytes: 0,
+                pull_errors: 0,
+                error_count: 0,
+                last_scan: String::new(),
+                has_conflict: false,
+            });
+        }
+        let agg = snap.aggregate_health();
+        assert_eq!(agg.total, 7);
+        assert_eq!(agg.healthy, 5); // 7 - 1 conflict - 1 syncing
+        assert!(matches!(agg.worst, FolderHealth::Conflict));
     }
 }

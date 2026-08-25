@@ -29,7 +29,7 @@ CONFIG_FILE = "manager_config.json"
 
 # Defaults if the file is absent or the keys aren't present. Chosen for
 # safety, not convenience:
-#   auto_host=False: a fresh install on a machine nobody's set up yet
+#   auto_host=True: a fresh install on a machine nobody's set up yet
 #     should NOT silently start claiming host on the tailnet — that would
 #     surprise other participants. Explicit opt-in via the Manager UI
 #     (or a manual edit) is the correct posture for a state-changing

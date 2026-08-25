@@ -322,12 +322,10 @@ pub fn validate_device_id(input: &str) -> Result<String, String> {
         .map(|c| c.to_ascii_uppercase())
         .collect();
 
-    // Canonical device ID is 56 base32 chars: 52 data chars + 4 Luhn
-    // check chars spliced in (one per 13-char quarter). Syncthing shows
-    // this as 8 dashed groups of 7 — see the comment further down.
-    if compact.len() != 56 {
+    // Canonical device ID is 52 base32 chars (data + check digits).
+    if compact.len() != 52 {
         return Err(format!(
-            "Device ID should be 56 characters (got {}). \
+            "Device ID should be 52 characters (got {}). \
              It looks like a partial copy.",
             compact.len()
         ));

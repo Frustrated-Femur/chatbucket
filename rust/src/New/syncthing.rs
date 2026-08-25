@@ -67,20 +67,6 @@ pub struct ManagerConfig {
     /// Per-resource managed flags (§16.5). Missing keys default to true.
     #[serde(default)]
     pub managed: ManagedState,
-    /// EVERY OTHER KEY the file contains, preserved untouched across
-    /// round-trips. Under the front-door integration this is what keeps
-    /// the Python-owned `auto_host` and `take_host_on_crash` booleans
-    /// alive when the Rust side saves the file. Same discipline
-    /// manager_config.py uses when IT writes: `_read_raw()` reads the
-    /// full dict and `update()` merges only its own keys, so unrecognized
-    /// keys from the other language survive both directions.
-    ///
-    /// This is deliberately typed as `serde_json::Value` per key rather
-    /// than a strong Rust type: the Rust Manager MUST NOT interpret
-    /// these fields itself. The front-door /control endpoint is the ONE
-    /// place that mutates them; we just pass them through.
-    #[serde(flatten)]
-    pub extras: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl ManagerConfig {
@@ -172,6 +158,7 @@ pub fn save_config(repo_root: &Path, mut cfg: ManagerConfig) -> Result<ManagerCo
     // §3: credential file must not inherit permissive default permissions.
     set_owner_only_permissions(&path);
 
+    invalidate_cache();
     Ok(cfg)
 }
 
@@ -1114,47 +1101,14 @@ impl SyncthingController {
     /// Device-ID → list of ChatBucket folder IDs it is associated with.
     /// Derived from CONFIG (not live status), used to render the device list
     /// and the "configured but not fully associated" signal (§6).
-    ///
-    /// Filtering rules — the reason this function exists rather than a raw
-    /// walk over `/rest/config/folders/*` (integration.md §1):
-    ///
-    ///   * Iterates ONLY the seven fixed ChatBucket folder IDs in
-    ///     `resources::RESOURCES`. An unrelated user folder that happens to
-    ///     be configured on the same Syncthing daemon cannot leak a device
-    ///     into ChatBucket's Devices list — its ID isn't one we ever ask
-    ///     about here.
-    ///   * Excludes THIS machine's own Syncthing device ID. Syncthing by
-    ///     design lists every device sharing a folder INCLUDING the local
-    ///     one, so a raw pass-through renders the local device as if it
-    ///     were a remote peer. `local_device_id()` is fetched once here
-    ///     rather than in `build_device_views()` so any future call site
-    ///     inherits the filter automatically — matching the .md's explicit
-    ///     "single caller, single filter" reasoning.
-    ///
-    /// If we cannot resolve the local device ID (Syncthing unreachable
-    /// mid-call, transient auth failure), we return the unfiltered map
-    /// rather than falsely dropping remote devices too. The caller
-    /// (`build_device_views`) will still show the correct "connection
-    /// unreachable" chip, so the user isn't misled.
     pub fn all_chatbucket_device_associations(&self) -> BTreeMap<String, Vec<String>> {
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let Ok(c) = self.client().map_err(conn_to_api) else {
             return out;
         };
-        // Best-effort local-ID fetch — see the docstring's rationale for
-        // falling through on error rather than dropping every device.
-        let local_id: Option<String> = c
-            .get_into::<SystemStatus>("/rest/system/status")
-            .ok()
-            .map(|s| s.my_id);
         for def in resources::RESOURCES {
             if let Ok(Some(fcfg)) = self.get_folder_config(&c, def.folder_id) {
                 for d in folder_config_devices(&fcfg) {
-                    if let Some(ref me) = local_id {
-                        if &d == me {
-                            continue;
-                        }
-                    }
                     out.entry(d).or_default().push(def.folder_id.to_string());
                 }
             }
@@ -1514,5 +1468,118 @@ pub struct PendingSnapshot {
     #[allow(dead_code)]
     pub unknown_requests: Vec<PendingRequest>,
 }
+
+// ── Legacy compatibility shim (kept for the tray/legacy probe) ──────────
+//
+// The original single-folder probe (FOLDER_ID = "sync-state") is retained as
+// a thin wrapper over the controller so existing call sites keep compiling
+// while the full integration is the primary path.
+
+pub const FOLDER_ID: &str = "sync-state";
+
+static LEGACY_CACHE: Mutex<Option<(Instant, LegacyState)>> = Mutex::new(None);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyState {
+    NotConfigured,
+    InSync,
+    Syncing,
+    AuthFailed,
+    Unreachable(String),
+    FolderMissing,
+    BadConfig(String),
+    Error(String),
+}
+
+impl LegacyState {
+    pub fn short_label(&self) -> String {
+        match self {
+            LegacyState::NotConfigured => "not configured".into(),
+            LegacyState::InSync => "in sync".into(),
+            LegacyState::Syncing => "syncing…".into(),
+            LegacyState::AuthFailed => "auth failed (401)".into(),
+            LegacyState::Unreachable(_) => "unreachable".into(),
+            LegacyState::FolderMissing => "folder not found".into(),
+            LegacyState::BadConfig(_) => "bad config".into(),
+            LegacyState::Error(_) => "error".into(),
+        }
+    }
+    pub fn detail(&self) -> String {
+        match self {
+            LegacyState::NotConfigured => "Paste an API key to enable the Syncthing probe.".into(),
+            LegacyState::InSync => "sync-state folder is idle and up to date.".into(),
+            LegacyState::Syncing => "sync-state folder is transferring or scanning.".into(),
+            LegacyState::AuthFailed => "Syncthing rejected the API key (401/403).".into(),
+            LegacyState::Unreachable(d) => format!("Could not reach Syncthing: {d}"),
+            LegacyState::FolderMissing => format!("No folder id '{FOLDER_ID}' on this Syncthing."),
+            LegacyState::BadConfig(d) => format!("manager_config.json could not be parsed: {d}"),
+            LegacyState::Error(d) => d.clone(),
+        }
+    }
+}
+
+pub fn invalidate_cache() {
+    if let Ok(mut g) = LEGACY_CACHE.lock() {
+        *g = None;
+    }
+}
+
+pub fn get_status(repo_root: &Path) -> LegacyState {
+    {
+        let guard = LEGACY_CACHE.lock().unwrap();
+        if let Some((when, ref st)) = *guard {
+            if when.elapsed() < Duration::from_secs(30) {
+                return st.clone();
+            }
+        }
+    }
+    let st = legacy_fetch(repo_root);
+    let mut guard = LEGACY_CACHE.lock().unwrap();
+    *guard = Some((Instant::now(), st.clone()));
+    st
+}
+
+fn legacy_fetch(repo_root: &Path) -> LegacyState {
+    let (cfg, parse_err) = read_config(repo_root);
+    if let Some(msg) = parse_err {
+        return LegacyState::BadConfig(msg);
+    }
+    let Some(api_key) = cfg.key() else {
+        return LegacyState::NotConfigured;
+    };
+    let url = format!("{}/rest/db/status?folder={}", cfg.url(), FOLDER_ID);
+    let resp = ureq::get(&url)
+        .set("X-API-Key", api_key)
+        .timeout(HTTP_TIMEOUT)
+        .call();
+    match resp {
+        Ok(r) => match r.into_json::<DbStatus>() {
+            Ok(body) => {
+                if body.pull_errors > 0 {
+                    LegacyState::Error(format!("{} pull error(s)", body.pull_errors))
+                } else if body.state == "error" {
+                    LegacyState::Error("folder is in error state".into())
+                } else if body.state == "idle" && body.need_files == 0 && body.need_bytes == 0 {
+                    LegacyState::InSync
+                } else {
+                    LegacyState::Syncing
+                }
+            }
+            Err(e) => LegacyState::Error(format!("bad JSON: {e}")),
+        },
+        Err(ureq::Error::Status(code, resp)) => match code {
+            401 | 403 => LegacyState::AuthFailed,
+            404 => LegacyState::FolderMissing,
+            _ => LegacyState::Error(format!("HTTP {} {}", code, resp.status_text())),
+        },
+        Err(ureq::Error::Transport(t)) => LegacyState::Unreachable(short_transport(t)),
+    }
+}
+
+pub fn test_now(repo_root: &Path) -> LegacyState {
+    invalidate_cache();
+    legacy_fetch(repo_root)
+}
+
 #[cfg(test)]
 mod tests;
