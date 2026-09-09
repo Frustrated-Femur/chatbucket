@@ -1,0 +1,300 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   ChatBucket — shell-refine.css   (PATCH LAYER · loads AFTER index.css,
+   perf-overlay.css and msg-actions.css)
+
+   v3 — corrected scope. The rule for this layer is now:
+
+     · PERSISTENT chrome (compose buttons, presence pills, the bar itself)
+       keeps index.css's exact look — flat, transparent, hairline hover.
+       We do NOT restyle it.
+     · PSEUDO-GLASS is reserved for FLOATING surfaces — the compose dock and
+       toasts (the message tray already has it in msg-actions.css).
+     · We only ever touch behaviour when something would OVERFLOW.
+
+   WHAT IT SOLVES
+   ──────────────
+   1. #presence-bar had `flex-wrap: wrap` — every extra user added a ROW to
+      the header. → One line, horizontally scrollable, edge fades only when
+      there's actually more to see. No count pill — just names.
+   2. Compose buttons collapse into a dock ONLY when the bar can't fit them
+      (measured live by the script, on any device, at any zoom). A desktop
+      window wide enough to hold them never sees the dock at all.
+   3. Long values that could push the layout around (attachment chips, toasts
+      on a 360px phone, long reply-to usernames).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* --cb-spring, --cb-snap, --cb-exit, --cb-t-micro/quick/panel and the
+   glass/smoke/blur/cast/lip tokens are now defined once in index.css
+   :root. Only file-local variants live here. */
+:root {
+    --cb-glass-strong: linear-gradient(180deg, rgba(255,255,255,0.085) 0%,
+                                               rgba(255,255,255,0.030) 46%,
+                                               rgba(255,255,255,0.010) 100%);
+}
+
+/* ═══ 1 · PRESENCE: one line, scrollable, names only ═══════════════════════ */
+
+/* THE FIX: never wrap; the header can never grow a second row again. */
+#presence-bar {
+    flex-wrap: nowrap !important;   /* beats index.css's flex-wrap: wrap */
+    overflow-x: auto;
+    overflow-y: hidden;
+    min-width: 0;                   /* lets the flex item actually shrink */
+    flex-shrink: 1;
+    max-width: 60%;
+    gap: 8px !important;
+    padding: 2px 0;
+    scroll-behavior: smooth;
+    scroll-snap-type: x proximity;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;                 /* Firefox */
+    -webkit-mask-image: none;
+            mask-image: none;
+}
+#presence-bar::-webkit-scrollbar { display: none; }
+
+/* Edge fades — applied by the script only while content overflows, so a
+   two-person chat is never needlessly dimmed. */
+#presence-bar.has-end {
+    -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 30px), transparent 100%);
+            mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 30px), transparent 100%);
+}
+#presence-bar.has-start {
+    -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 30px, #000 100%);
+            mask-image: linear-gradient(90deg, transparent 0, #000 30px, #000 100%);
+}
+#presence-bar.has-start.has-end {
+    -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 30px,
+                                        #000 calc(100% - 30px), transparent 100%);
+            mask-image: linear-gradient(90deg, transparent 0, #000 30px,
+                                        #000 calc(100% - 30px), transparent 100%);
+}
+
+/* Pills keep index.css's look. We only stop them breaking layout. */
+.presence-pill {
+    flex-shrink: 0;                       /* never squash into mush */
+    scroll-snap-align: end;
+    max-width: 150px;                     /* long names truncate, not stretch */
+}
+.presence-pill > span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+/* Offline users recede rather than shout. */
+.presence-pill:has(.status-dot.offline) { opacity: 0.55; }
+
+@media (hover: hover) and (pointer: fine) {
+    .presence-pill {
+        transition: transform var(--cb-t-quick) var(--cb-spring),
+                    border-color var(--cb-t-micro) ease;
+    }
+    .presence-pill:hover {
+        transform: translateY(-1px);
+        border-color: var(--border-2);
+    }
+}
+
+@media (max-width: 640px) {
+    #presence-bar { max-width: 100%; }
+    .presence-pill { max-width: 118px; font-size: 11px; }
+    /* The header itself stays one line, whatever the user count. */
+    #header { flex-wrap: nowrap; overflow: hidden; }
+    #header h1 { flex-shrink: 0; }
+}
+/* Very narrow: the wordmark yields before the presence data does. */
+@media (max-width: 420px) {
+    #header h1 { display: none; }
+    #presence-bar { max-width: calc(100% - 46px); }
+}
+
+/* ═══ 2 · COMPOSE DOCK — used ONLY when the bar would overflow ═════════════
+   The script measures #bottom-bar; while everything fits, the four original
+   buttons stay exactly where index.css put them and this entire block is
+   inert (the trigger is display:none, the dock unmounted). */
+
+/* The trigger copies the stock compose-button look from index.css 1:1 —
+   transparent, flat, hairline hover — so it reads as "one more icon",
+   not a new component. */
+#cb-dock-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    height: 38px;
+    min-width: 38px;
+    padding: 8px;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--text-2);
+    cursor: pointer;
+    line-height: 0;
+    position: relative;
+    transition: background var(--cb-t-micro) ease, color var(--cb-t-micro) ease,
+                transform var(--cb-t-quick) var(--cb-snap);
+}
+#cb-dock-btn:hover  { background: var(--surface-3); color: var(--text); }
+#cb-dock-btn:active { transform: scale(0.94); transition-duration: 90ms; }
+#cb-dock-btn .cb-plus {
+    width: 17px; height: 17px;
+    position: relative;
+    transition: transform var(--cb-t-panel) var(--cb-spring);
+}
+/* Drawn glyph, not an icon font — rotates 135° into a close affordance. */
+#cb-dock-btn .cb-plus::before,
+#cb-dock-btn .cb-plus::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    background: currentColor;
+    border-radius: 2px;
+}
+#cb-dock-btn .cb-plus::before { width: 100%; height: 1.6px; }
+#cb-dock-btn .cb-plus::after  { width: 1.6px; height: 100%; }
+#cb-dock-btn[aria-expanded="true"] .cb-plus { transform: rotate(135deg); }
+/* State tick while a drawer is open behind the collapsed controls. */
+#cb-dock-btn.has-active::after {
+    content: "";
+    position: absolute;
+    top: 6px; right: 6px;
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--link);
+    box-shadow: 0 0 8px var(--link);
+}
+
+/* The dock itself — a floating surface, so THIS is where the glass lives. */
+#cb-dock {
+    position: fixed;
+    z-index: 2147481500;
+    display: none;
+    flex-direction: column;
+    gap: 1px;
+    padding: 6px;
+    min-width: 200px;
+    border-radius: 15px;
+    background: var(--cb-glass), var(--cb-smoke);
+    border: 1px solid rgba(255,255,255,0.10);
+    box-shadow: var(--cb-cast), var(--cb-lip);
+    -webkit-backdrop-filter: var(--cb-blur);
+            backdrop-filter: var(--cb-blur);
+    opacity: 0;
+    transform: translateY(7px) scale(0.97);
+    transform-origin: bottom left;
+    transition: opacity var(--cb-t-micro) var(--cb-exit),
+                transform var(--cb-t-panel) var(--cb-spring);
+    will-change: transform, opacity;
+    contain: layout paint style;
+}
+#cb-dock.is-mounted { display: flex; }
+#cb-dock.is-open    { opacity: 1; transform: none; }
+
+#cb-dock .cb-dock-head {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--text-4);
+    padding: 5px 9px 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    margin-bottom: 4px;
+    user-select: none;
+}
+
+/* Rows host the ORIGINAL buttons (moved, not recreated) plus a label.
+   The row itself is plain — hover is a whisper, matching index.css. */
+.cb-dock-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 8px 2px 2px;
+    border-radius: 10px;
+    cursor: pointer;
+    color: var(--text-2);
+    opacity: 0;
+    transform: translateX(-5px);
+    animation: cb-dock-in 300ms var(--cb-spring) forwards;
+    animation-delay: calc(var(--i, 0) * 32ms + 30ms);
+    transition: background var(--cb-t-micro) ease, color var(--cb-t-micro) ease;
+}
+@keyframes cb-dock-in { to { opacity: 1; transform: none; } }
+.cb-dock-row:hover  { background: var(--surface-3); color: var(--text); }
+.cb-dock-row:active { background: var(--surface-4); }
+.cb-dock-row > button { pointer-events: none; }   /* the ROW owns the click */
+.cb-dock-lbl {
+    flex: 1;
+    font-size: 13.5px;
+    letter-spacing: -0.008em;
+    white-space: nowrap;
+}
+.cb-dock-key {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--text-4);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 4px;
+    padding: 1px 5px;
+}
+body.cb-touch .cb-dock-key { display: none; }
+
+/* ═══ 3 · OVERFLOW CASES (behaviour only — no restyling) ══════════════════ */
+
+/* Attachments: wrapping grew the composer without limit. One scrollable row,
+   same idiom as presence — consistency is the point. */
+#preview-list {
+    flex-wrap: nowrap !important;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+    overscroll-behavior-x: contain;
+}
+#preview-list::-webkit-scrollbar { height: 5px; }
+#preview-list::-webkit-scrollbar-thumb { background: #2f2f2f; border-radius: 3px; }
+.preview-item { flex-shrink: 0; }
+#attachment-preview { flex-wrap: nowrap !important; }
+#cancel-attach { flex-shrink: 0; }
+
+/* Toast: 400px cannot fit a 360px phone. Glass is fine here — it's floating. */
+#toast-container { max-width: calc(100vw - 24px); }
+.toast {
+    max-width: 100% !important;
+    background: var(--cb-glass), var(--cb-smoke) !important;
+    border-color: rgba(255,255,255,0.10) !important;
+    box-shadow: var(--cb-cast), var(--cb-lip);
+    -webkit-backdrop-filter: var(--cb-blur);
+            backdrop-filter: var(--cb-blur);
+    overflow-wrap: anywhere;
+}
+
+/* Reply bar: long usernames must not shove the close button off-screen. */
+#reply-bar-inner { min-width: 0; }
+#reply-bar-user  { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#reply-bar-close { flex-shrink: 0; }
+
+/* ═══ 4 · MOTION / A11Y ════════════════════════════════════════════════════ */
+/* Touch has no hover — a lift that only fires on tap reads as a glitch. */
+@media (hover: none) {
+    #cb-dock-btn:hover { background: transparent; transform: none; }
+    .presence-pill:hover { transform: none; }
+}
+
+#cb-dock-btn:focus-visible,
+.cb-dock-row:focus-visible {
+    outline: 2px solid rgba(125,185,255,0.55);
+    outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #cb-dock, .cb-dock-row, #cb-dock-btn .cb-plus, .presence-pill {
+        transition-duration: 1ms !important;
+        animation: none !important;
+    }
+    .cb-dock-row { opacity: 1; transform: none; }
+    #cb-dock { transform: none; }
+    #presence-bar { scroll-behavior: auto; }
+}

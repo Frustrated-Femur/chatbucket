@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>ChatBucket</title>
+
+    <!-- Base sheet. Owns tokens, layout, and every persistent-chrome rule. -->
+    <link rel="stylesheet" href="/static/index.css?v=1756339200">
+
+    <!-- [PERF] Overlay stylesheet. Loaded AFTER index.css so its rules win the
+         cascade without needing !important spam. GPU compositing, spring
+         easings, content-visibility on off-screen bubbles. -->
+    <link rel="stylesheet" href="/static/perf-overlay.css?v=3">
+
+    <!-- [UX] Message-actions overlay. Owns the long-press instrument tray and
+         selection mode. Non-intrusive: nothing here changes document flow. -->
+    <link rel="stylesheet" href="/static/msg-actions.css?v=3">
+
+    <!-- [UX] Shell refinement. Owns the presence rail's overflow behaviour and
+         the adaptive compose dock (only mounted when the bar actually can't
+         fit its buttons). Behaviour-only — no restyling of persistent chrome. -->
+    <link rel="stylesheet" href="/static/shell-refine.css?v=4">
+
+    <!-- [FIX] Failure-mode fixes + music-island smoothness. Owns the edit-meta
+         ghost sweep, compositor-only island animation, and OS-aware copy visuals. -->
+    <link rel="stylesheet" href="/static/fix-refine.css?v=2">
+
+    <!-- [UX]/[PERF] Media smoothness overlay. Loads LAST so its rules win ties
+         without !important. Owns video thumbnails (chat + ready-to-send tray),
+         eager-loading coercion, reserved media boxes, and fade-in polish. -->
+    <link rel="stylesheet" href="/static/media-smooth.css?v=1">
+
+    <link rel="icon" href="/static/icons/favicon.png">
+
+    <!-- [PERF] Preconnect to origins we'll hit — parallel DNS/TLS warm-up. -->
+    <link rel="preconnect" href="https://static.cloudflareinsights.com" crossorigin>
+    <link rel="dns-prefetch" href="https://static.cloudflareinsights.com">
+    <!-- Preload the notify sound so the first message doesn't stall on fetch. -->
+    <link rel="preload" as="audio" href="/static/connect.mp3">
+
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#000000">
+    <meta name="color-scheme" content="dark">
+</head>
+<body>
+
+<div id="join-screen">
+    <h1>ChatBucket</h1>
+    <input id="username" placeholder="Choose a username" maxlength="20"
+           onkeydown="if(event.key==='Enter') joinChat()">
+    <button onclick="joinChat()">Join</button>
+</div>
+
+
+<div id="chat-screen" style="display:none;">
+    <div id="header">
+        <img src="/static/icons/favicon.png" id="chat-logo" alt="">
+        <h1>ChatBucket</h1>
+        <div id="presence-bar"></div>
+    </div>
+
+    <div id="messages"></div>
+
+    <div id="bottom-zone">
+
+        <div id="reply-bar">
+            <div id="reply-bar-inner">
+                <span id="reply-bar-label">Replying to</span>
+                <span id="reply-bar-user"></span>
+                <span id="reply-bar-text"></span>
+            </div>
+            <button id="reply-bar-close" onclick="clearReply()" aria-label="Cancel reply">
+                <span class="icon close sm"></span>
+            </button>
+        </div>
+
+        <progress id="upload-progress" value="0" max="100" style="display:none;"></progress>
+
+        <div id="attachment-preview">
+            <div id="preview-list"></div>
+            <button id="cancel-attach" onclick="clearAttachments()">Clear all</button>
+        </div>
+
+        <!-- ── STICKER PANEL ─────────────────────────────────────────────
+             Every panel now shares the .cb-panel* class family (see
+             index.css). No inline styles: state (open/closed, tab-active)
+             is expressed through data-* / .is-active classes so the CSS,
+             not the JS, owns the visual language. -->
+        <div id="sticker-manager-panel" class="cb-panel" style="display:none;">
+
+            <div class="cb-panel-header">
+                <span class="cb-panel-title">Stickers</span>
+                <div class="cb-panel-header-actions">
+                    <button id="sticker-manual-upload-btn" class="cb-panel-upload"
+                            onclick="document.getElementById('sticker-hidden-file-input').click()">
+                        + Add Sticker
+                    </button>
+                    <input type="file" id="sticker-hidden-file-input"
+                           accept=".png,.gif,.webp,.jpg,.jpeg"
+                           style="display:none;" onchange="handleManualStickerSelection(this)">
+                    <button class="panel-close-btn" onclick="toggleStickerDrawer()" aria-label="Close stickers">
+                        <span class="icon close sm"></span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="cb-panel-body">
+                <div id="sticker-folders" class="cb-panel-folders">
+                    <button id="btn-new-sticker-folder" class="cb-panel-newfolder">+ New Folder</button>
+                    <div id="sticker-folder-list-container"></div>
+                </div>
+                <div class="cb-panel-content">
+                    <div id="sticker-dropzone" class="cb-panel-dropzone">
+                        Drag &amp; Drop or click "+ Add Sticker"
+                    </div>
+                    <div id="sticker-grid" class="cb-panel-grid cb-panel-grid--sticker"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── GIF PANEL ────────────────────────────────────────────────── -->
+        <div id="gif-manager-panel" class="cb-panel" style="display:none;">
+
+            <div class="cb-panel-header">
+                <div id="gif-tabs" class="cb-panel-tabs">
+                    <button id="tab-local-btn" class="cb-panel-tab is-active"
+                            onclick="switchGifTab('local')">Local Spaces</button>
+                    <button id="tab-giphy-btn" class="cb-panel-tab"
+                            onclick="switchGifTab('giphy')">Giphy</button>
+                </div>
+                <div class="cb-panel-header-actions">
+                    <button id="gif-manual-upload-btn" class="cb-panel-upload"
+                            onclick="document.getElementById('gif-hidden-file-input').click()">
+                        + Add GIF File
+                    </button>
+                    <input type="file" id="gif-hidden-file-input" accept=".gif,.webp" multiple
+                           style="display:none;" onchange="handleManualGifSelection(this)">
+                    <button id="gif-close-pane-btn" class="panel-close-btn"
+                            onclick="toggleGifDrawer()" aria-label="Close GIF panel">
+                        <span class="icon close sm"></span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="engine-local-view" class="cb-panel-body">
+                <div id="gif-folders" class="cb-panel-folders">
+                    <button id="btn-new-folder" class="cb-panel-newfolder">+ New Space</button>
+                    <div id="folder-list-container"></div>
+                </div>
+                <div id="gif-content-pane" class="cb-panel-content">
+                    <div id="gif-dropzone" class="cb-panel-dropzone">
+                        Drag &amp; Drop or click "+ Add GIF File" to save assets here
+                    </div>
+                    <div id="gif-grid" class="cb-panel-grid cb-panel-grid--gif"></div>
+                </div>
+            </div>
+
+            <div id="engine-giphy-view" class="cb-panel-body cb-panel-body--column" style="display:none;">
+                <div class="cb-panel-searchrow">
+                    <input id="giphy-search-input" class="cb-panel-search"
+                           placeholder="Search Giphy..."
+                           onkeydown="if(event.key==='Enter') searchGiphy()">
+                    <button class="cb-panel-searchbtn" onclick="searchGiphy()">Search</button>
+                </div>
+                <div id="giphy-grid" class="cb-panel-grid cb-panel-grid--gif"></div>
+            </div>
+        </div>
+
+        <!-- ── MUSIC PANEL ──────────────────────────────────────────────── -->
+        <div id="music-manager-panel" class="cb-panel" style="display:none;">
+
+            <div class="cb-panel-header">
+                <div id="music-tabs" class="cb-panel-tabs">
+                    <button id="music-tab-local-btn" class="cb-panel-tab is-active"
+                            onclick="switchMusicTab('local')">Local</button>
+                    <button id="music-tab-youtube-btn" class="cb-panel-tab"
+                            onclick="switchMusicTab('youtube')">YouTube</button>
+                    <button id="music-tab-ytdlp-btn" class="cb-panel-tab"
+                            onclick="switchMusicTab('ytdlp')">yt-dlp</button>
+                </div>
+                <div class="cb-panel-header-actions">
+                    <button id="music-manual-upload-btn" class="cb-panel-upload"
+                            onclick="document.getElementById('music-hidden-file-input').click()">
+                        + Add Music File
+                    </button>
+                    <input type="file" id="music-hidden-file-input" multiple
+                           accept=".mp3,.wav,.ogg,.m4a,.aac,.flac"
+                           style="display:none;" onchange="handleManualMusicSelection(this)">
+                    <button id="music-close-pane-btn" class="panel-close-btn"
+                            onclick="toggleMusicDrawer()" aria-label="Close music panel">
+                        <span class="icon close sm"></span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="music-engine-local-view" class="cb-panel-body">
+                <div id="music-folders" class="cb-panel-folders">
+                    <button id="btn-new-music-folder" class="cb-panel-newfolder">+ New Folder</button>
+                    <div id="music-folder-list-container"></div>
+                </div>
+                <div id="music-content-pane" class="cb-panel-content">
+                    <div id="music-dropzone" class="cb-panel-dropzone">
+                        Drag &amp; Drop or click "+ Add Music File" to save assets here
+                    </div>
+                    <div id="music-grid" class="cb-panel-grid cb-panel-grid--music"></div>
+                </div>
+            </div>
+
+            <div id="music-engine-youtube-view" class="cb-panel-body cb-panel-body--column" style="display:none;">
+                <div class="cb-panel-searchrow">
+                    <input id="youtube-search-input" class="cb-panel-search"
+                           placeholder="Search YouTube..."
+                           onkeydown="if(event.key==='Enter') searchYouTube()">
+                    <button class="cb-panel-searchbtn" onclick="searchYouTube()">Search</button>
+                </div>
+                <div id="youtube-results-list" class="cb-panel-list"></div>
+            </div>
+
+            <div id="music-engine-ytdlp-view" class="cb-panel-body cb-panel-body--column" style="display:none;">
+                <div class="cb-panel-searchrow">
+                    <input id="ytdlp-search-input" class="cb-panel-search"
+                           placeholder="Search (yt-dlp, audio only)..."
+                           onkeydown="if(event.key==='Enter') searchYtdlp()">
+                    <button class="cb-panel-searchbtn" onclick="searchYtdlp()">Search</button>
+                </div>
+                <div id="ytdlp-results-list" class="cb-panel-list"></div>
+            </div>
+        </div>
+
+        <div id="bottom-bar">
+            <input type="file" id="file-input" style="display:none" multiple>
+
+            <button id="attach-btn" onclick="document.getElementById('file-input').click()" title="Attach file (Alt+A)" aria-label="Attach file">
+                <span class="icon attach"></span>
+            </button>
+
+            <button id="sticker-toggle-btn" onclick="toggleStickerDrawer()" title="Stickers (Alt+S)" aria-label="Stickers">
+                <span class="icon sticker"></span>
+            </button>
+
+            <!-- GIF badge icon — inlined as a data-URI in index.css (.icon.gif)
+                 so it can never 404; no external SVG, no text-chip fallback. -->
+            <button id="gif-toggle-btn" onclick="toggleGifDrawer()" title="GIFs (Alt+G)" aria-label="GIFs">
+                <span class="icon gif"></span>
+            </button>
+
+            <button id="music-toggle-btn" onclick="toggleMusicDrawer()" title="Music (Alt+M)" aria-label="Music">
+                <span class="icon music"></span>
+            </button>
+
+            <div id="message-input" contenteditable="true" placeholder="Type a message..."></div>
+
+            <button id="send-btn" onclick="sendMessage()" title="Send" aria-label="Send message">
+                <span class="icon send sm"></span>
+            </button>
+        </div>
+
+    </div>
+</div>
+
+<audio id="notify-sound" src="/static/connect.mp3" preload="auto"></audio>
+
+<!-- Drop overlay & dropzones are CSS-suppressed under (hover: none) — see
+     index.css. Nothing about the DOM contract changes; only touch pointers
+     stop seeing them, since drag-and-drop is a desktop-only affordance. -->
+<div id="drop-overlay">
+    <span class="icon attach"></span>
+    <span>Drop to attach</span>
+</div>
+
+<div id="media-viewer" onclick="closeMediaViewer(event)">
+    <img id="viewer-image" style="display:none;" alt="">
+    <video id="viewer-video" controls style="display:none;"></video>
+</div>
+
+<script src="/static/index.js?v=2026082701"></script>
+<!-- [PERF] Overlay script — loaded AFTER index.js so it can monkey-patch
+     hot-path functions with cached / batched / GPU-friendly versions.
+     Each patch keeps the original as a fallback. -->
+<script src="/static/perf-overlay.js?v=2" defer></script>
+<!-- [UX] Message-actions patch layer — wraps buildMessageEl / copyMessageText /
+     applyDeleteToDOM / setReply. Failures degrade to stock behaviour. -->
+<script src="/static/msg-actions.js?v=3" defer></script>
+<!-- [UX] Shell patch layer — moves the compose buttons into a dock when the
+     compose bar can't fit them, wraps #presence-bar in a scrollable rail. -->
+<script src="/static/shell-refine.js?v=3" defer></script>
+<!-- [FIX] Failure-mode fixes. Wraps saveInlineEdit /
+     cancelInlineEdit / applyEditToDOM etc. and installs the OS-aware
+     clipboard path. Each wrapper try/catches back to the original. -->
+<script src="/static/fix-refine.js?v=2" defer></script>
+<!-- [UX]/[PERF] Media-smooth patch layer — MUST load last. DOM-driven
+     (MutationObserver), never touches index.js internals; failures degrade
+     to stock behaviour. Owns video-poster capture, lazy-loading removal
+     (including a wrapped .loading property setter), and tray thumbnails. -->
+<script src="/static/media-smooth.js?v=1" defer></script>
+<!-- [UX] Video-thumbnail patch — upgrades the text-only .video-thumbnail-container
+     chat bubbles to show a real captured frame from the video (media-smooth only
+     covers pre-existing <video>/<a> nodes, not these placeholder cards). Lazy,
+     IntersectionObserver-gated, degrades to the stock placeholder on any failure. -->
+<script src="/static/video-thumbs.js?v=1" defer></script>
+
+<!-- Single Cloudflare beacon. Duplicate module beacons from the original
+     have been removed — they shipped identical hashes and did nothing extra. -->
+<script defer
+        src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496"
+        integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ=="
+        data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}'
+        crossorigin="anonymous"></script>
+</body>
+</html>

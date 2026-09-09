@@ -1,0 +1,194 @@
+/* ==========================================================================
+   media-smooth.css — [UX] overlay. MUST load LAST (after fix-refine.css).
+
+   Owns the visual language of the media-smooth.js layer:
+     • video-thumbnail shells (chat bubbles + file cards + ready-to-send tray)
+     • play-glyph affordance + hover states
+     • reserved media boxes (no layout shift while posters capture)
+     • image fade-in (compositor-only: opacity/transform, never layout props)
+     • GPU-promoted, spring-eased preview tray
+
+   All animation is transform/opacity only, so it stays on the compositor
+   thread and never fights the layout engine.
+   ========================================================================== */
+
+/* ── Video thumbnail shell (chat bubbles & file cards) ─────────────────── */
+
+.ms-videothumb {
+    position: relative;
+    display: inline-block;
+    max-width: 100%;
+    border-radius: 14px;
+    overflow: hidden;
+    vertical-align: bottom;
+    contain: content;                 /* isolate paint/layout from neighbours */
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.ms-videothumb .ms-video {
+    display: block;
+    max-width: min(420px, 100%);
+    max-height: 320px;
+    border-radius: 14px;
+    background: #000;
+    object-fit: cover;
+}
+
+/* Play glyph — drawn by CSS, zero assets, zero layout cost. */
+.ms-videothumb::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%) scale(0.92);
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.55);
+    background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9 7v10l8-5z" fill="%23ffffff"/></svg>');
+    background-repeat: no-repeat;
+    background-position: 55% 50%;
+    background-size: 22px 22px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 160ms ease-out, transform 160ms ease-out;
+    will-change: opacity, transform;
+}
+
+/* Show the glyph until the video actually starts playing. */
+.ms-videothumb:hover::after,
+.ms-videothumb .ms-video:not([controls]) ~ ::after {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+}
+
+/* File-card variant: a compact 16:9 strip prepended to the download link. */
+.ms-videothumb--card {
+    display: block;
+    width: min(280px, 100%);
+    aspect-ratio: 16 / 9;             /* reserved box → zero CLS */
+    margin-bottom: 6px;
+}
+
+.ms-videothumb--card .ms-video--card {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.ms-videothumb--card::after {
+    opacity: 1;                        /* cards aren't controls — always hint */
+}
+
+/* ── Ready-to-send tray thumbnails ─────────────────────────────────────── */
+
+.ms-tray-thumb {
+    position: relative;
+    display: inline-flex;
+    width: 96px;
+    height: 96px;
+    flex: 0 0 auto;
+    border-radius: 12px;
+    overflow: hidden;
+    margin-right: 8px;
+    background: rgba(255, 255, 255, 0.05);
+    contain: content;
+    vertical-align: middle;
+}
+
+.ms-tray-thumb img,
+.ms-tray-thumb video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+/* Small play glyph so video thumbs are distinguishable from image thumbs. */
+.ms-tray-thumb::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 30px;
+    height: 30px;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.6);
+    background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9 7v10l8-5z" fill="%23ffffff"/></svg>');
+    background-repeat: no-repeat;
+    background-position: 55% 50%;
+    background-size: 15px 15px;
+    pointer-events: none;
+}
+
+/* Tray itself: promote to its own layer so picking/scrolling files never
+   re-rasterises the message list behind it. */
+#preview-list > * {
+    will-change: transform;
+    transition: transform 140ms ease-out, opacity 140ms ease-out;
+}
+
+/* ── Eager image fade-in (compositor-only) ─────────────────────────────── */
+
+img.ms-fade {
+    opacity: 0;
+    transform: translateZ(0);          /* own layer — no paint of neighbours */
+    transition: opacity 180ms ease-out;
+}
+
+img.ms-fade.ms-loaded {
+    opacity: 1;
+}
+
+/* Never animate the presence-rail avatars / icons — they're chrome, not media. */
+#presence-bar img,
+#header img,
+.cb-panel-folders img {
+    opacity: 1 !important;
+    transform: none !important;
+    transition: none !important;
+}
+
+/* ── Reduced-motion respect ────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+    img.ms-fade,
+    .ms-videothumb::after,
+    #preview-list > * {
+        transition: none !important;
+    }
+    img.ms-fade { opacity: 1; }
+}
+
+/* ── video-thumbs.js: captured frame inside the text-only video bubble ──────
+   The stock .video-thumbnail-container is a text placeholder (play glyph +
+   filename). Once video-thumbs.js captures a frame we lay the image under the
+   overlay, darken it slightly so the glyph/name stay readable, and relax the
+   fixed padding so the frame can fill the card. */
+.video-thumbnail-container.has-thumb {
+    padding: 0 !important;
+    overflow: hidden;
+    min-height: 140px;
+}
+.video-thumbnail-container .video-thumb {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.video-thumbnail-container.has-thumb .icon.play,
+.video-thumbnail-container.has-thumb .video-name {
+    position: relative;
+    z-index: 1;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85);
+}
+.video-thumbnail-container.has-thumb::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.28);
+    pointer-events: none;
+}

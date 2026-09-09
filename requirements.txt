@@ -1,0 +1,16 @@
+# ChatBucket dedicated-server runtime dependencies.
+# Install with:  pip install -r requirements.txt
+
+# Core web stack
+flask>=3.0
+flask-sock>=0.7
+werkzeug>=3.0
+
+# YouTube / audio extraction
+yt-dlp>=2024.8.6
+
+# Optional but recommended (server.py degrades gracefully if missing):
+# - flask-compress: gzip /history and static responses (~75% smaller)
+# - requests:       keep-alive HTTP session for the Giphy proxy
+flask-compress>=1.14
+requests>=2.31

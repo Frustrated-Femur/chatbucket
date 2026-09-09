@@ -1,0 +1,9 @@
+# Production WSGI stack for the 24/7 dedicated server on Ubuntu.
+# Layered ON TOP of requirements.txt:
+#     pip install -r requirements.txt -r requirements-prod-posix.txt
+#
+# gunicorn + gevent is the flask-sock-compatible combo that server.py's
+# WebSocket path was authored against. See systemd/chatbucket.service for
+# the actual invocation.
+gunicorn>=21.2
+gevent>=24.2

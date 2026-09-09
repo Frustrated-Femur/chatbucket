@@ -1,0 +1,35 @@
+# Runtime data (per README_FOR_AI.md — restored from backup, not in source)
+messages/
+uploads/
+stickers/
+gifs/
+sfx/
+presence/
+push_tokens/
+state/
+deleted/
+
+# Secrets
+fcm_service_account.json
+service-account.json
+firebase-adminsdk.json
+cookies.txt
+.env
+.env.local
+/etc/chatbucket/
+
+# Legacy multi-host artifacts (present under legacy/ only for reference)
+manager_config.json
+.chatbucket.pid
+cbm
+rust/target/
+
+# Python / editor cruft
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Optional
+.codex/
+.agents/

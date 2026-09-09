@@ -1,0 +1,74 @@
+[Unit]
+Description=ChatBucket dedicated server (gunicorn + gevent)
+Documentation=file:///opt/chatbucket/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chatbucket
+Group=chatbucket
+WorkingDirectory=/opt/chatbucket
+
+# Environment: bind address, Firebase creds path, Giphy key, proxy hops.
+# The referenced file MUST be mode 0640 and owned by the chatbucket user.
+EnvironmentFile=/etc/chatbucket/chatbucket.env
+
+# Runtime data lives under WorkingDirectory:
+#   messages/  uploads/  gifs/  stickers/  sfx/  presence/  push_tokens/
+# Firebase credentials live OUTSIDE WorkingDirectory at /etc/chatbucket/
+# so a "git clean -fdx" in /opt/chatbucket can never delete them.
+
+ExecStart=/opt/chatbucket/.venv/bin/gunicorn \
+    --workers 1 \
+    --worker-class gevent \
+    --threads 16 \
+    --bind ${CHATBUCKET_HOST}:${CHATBUCKET_PORT} \
+    --graceful-timeout 5 \
+    --timeout 120 \
+    --keep-alive 30 \
+    --access-logfile - \
+    --error-logfile - \
+    --log-level info \
+    server:app
+
+# Restart policy: crash-loop protection with backoff.
+Restart=always
+RestartSec=3
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Graceful shutdown: match gunicorn's --graceful-timeout + headroom.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Logging goes to the journal.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chatbucket
+
+# ── Hardening ─────────────────────────────────────────────────────────
+# The service does NOT need root, network admin, or write access outside
+# its own working directory + /etc/chatbucket (read-only).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/chatbucket
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# ^ gevent's greenlet needs writable+executable pages; leave this off.
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# File-descriptor budget: raised for lots of concurrent websockets +
+# uploads + push-notification connections.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
