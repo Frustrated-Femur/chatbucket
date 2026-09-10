@@ -3546,6 +3546,11 @@ function showChat() {
 }
 
 // ── media viewer ──────────────────────────────────────────────────────────────
+// [DEPRECATED] Stock single-media overlay. media-viewer.js (loaded last)
+// wraps window.openMediaViewer / openImageViewer / closeMediaViewer and routes
+// every call into the new takeover viewer / attachment preview composer, so
+// every existing call site (chat bubbles, tray chips) keeps working untouched.
+// These originals remain as the documented fallback contract.
 function openMediaViewer(src, type, opts = {}) {
     const viewer = $("media-viewer");
     const img    = $("viewer-image");
@@ -3590,6 +3595,9 @@ function openMediaViewer(src, type, opts = {}) {
 
 // Legacy alias — some templates may still reference this global.
 function openImageViewer(src) { openMediaViewer(src, "image"); }
+window.openMediaViewer  = openMediaViewer;   // export so media-viewer.js can wrap
+window.openImageViewer  = openImageViewer;
+window.closeMediaViewer = closeMediaViewer;
 
 function closeMediaViewer(e) {
     // If the user just panned, the mouseup fires a click on the overlay —
@@ -5562,8 +5570,13 @@ document.addEventListener("DOMContentLoaded", () => {
     injectQoLStyles();
 
     // [QoL] Viewer: scroll-to-zoom, pinch-zoom, 2-finger pan, mouse-drag pan, dblclick reset.
+    // [DEPRECATED] The stock <img>/<video> viewer was replaced by the
+    // media-viewer.js takeover shell (header/stage/filmstrip/reply composer).
+    // The #viewer-image/#viewer-video elements no longer exist, so this whole
+    // block is inert — guarded on the image node so it never throws if the
+    // old markup is ever absent (as it now always is).
     const _viewerEl = $("media-viewer");
-    if (_viewerEl) {
+    if (_viewerEl && $("viewer-image")) {
         const _applyViewerTransform = (imgEl) => {
             imgEl.style.transform =
                 `translate(${_viewerTransX}px,${_viewerTransY}px) scale(${_viewerScale})`;

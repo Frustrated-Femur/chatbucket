@@ -30,6 +30,12 @@
          eager-loading coercion, reserved media boxes, and fade-in polish. -->
     <link rel="stylesheet" href="/static/media-smooth.css?v=1">
 
+    <!-- [UX] Media viewer + attachment preview composer. Loads LAST among
+         stylesheets: owns the takeover viewer shell (header / stage / edge
+         arrows / filmstrip / in-viewer reply) and the caption composer.
+         Pseudo-glass, transform-only motion, reduced-motion aware. -->
+    <link rel="stylesheet" href="/static/media-viewer.css?v=1">
+
     <link rel="icon" href="/static/icons/favicon.png">
 
     <!-- [PERF] Preconnect to origins we'll hit — parallel DNS/TLS warm-up. -->
@@ -268,10 +274,10 @@
     <span>Drop to attach</span>
 </div>
 
-<div id="media-viewer" onclick="closeMediaViewer(event)">
-    <img id="viewer-image" style="display:none;" alt="">
-    <video id="viewer-video" controls style="display:none;"></video>
-</div>
+<!-- Media viewer placeholder — media-viewer.js replaces this node with the
+     full takeover shell (header / stage / filmstrip / reply composer) and
+     relocates it inside #chat-screen. The stock img/video overlay is gone. -->
+<div id="media-viewer"></div>
 
 <script src="/static/index.js?v=2026082701"></script>
 <!-- [PERF] Overlay script — loaded AFTER index.js so it can monkey-patch
@@ -298,6 +304,11 @@
      covers pre-existing <video>/<a> nodes, not these placeholder cards). Lazy,
      IntersectionObserver-gated, degrades to the stock placeholder on any failure. -->
 <script src="/static/video-thumbs.js?v=1" defer></script>
+<!-- [UX] Media viewer / preview composer / Back-priority stack — MUST load
+     last: it wraps openMediaViewer/closeMediaViewer/sendMessage and
+     registers every transient UI layer (tray, selection, panels, reply bar,
+     attachments, viewers) into one centralized Back/Escape stack. -->
+<script src="/static/media-viewer.js?v=1" defer></script>
 
 <!-- Single Cloudflare beacon. Duplicate module beacons from the original
      have been removed — they shipped identical hashes and did nothing extra. -->
